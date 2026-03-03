@@ -4,6 +4,7 @@ body {
   font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
   margin: 0;
   padding: 16px;
+  font-size: 14px;
 }
 
 .header {
@@ -22,10 +23,12 @@ h1 {
 }
 
 .status {
-  font-size: 0.8rem;
-  padding: 2px 6px;
-  border-radius: 4px;
+  font-size: 0.75rem;
+  padding: 3px 8px;
+  border-radius: 12px;
   background-color: #45475a;
+  color: #a6adc8;
+  transition: all 0.3s ease;
 }
 .status.connected {
   background-color: #a6e3a1;
@@ -40,95 +43,195 @@ h1 {
 }
 
 .btn {
-  padding: 10px;
+  padding: 12px;
   border: none;
-  border-radius: 6px;
+  border-radius: 8px;
   font-weight: bold;
   cursor: pointer;
-  transition: all 0.2s;
+  transition: all 0.2s ease;
+  font-size: 0.9rem;
+}
+.btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
 }
 
 .primary {
-  background-color: #89b4fa;
+  background: linear-gradient(135deg, #89b4fa 0%, #74c7ec 100%);
   color: #1e1e2e;
 }
-.primary:hover {
-  background-color: #74c7ec;
+.primary:hover:not(:disabled) {
+  background: linear-gradient(135deg, #74c7ec 0%, #89dceb 100%);
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(137, 180, 250, 0.3);
 }
 
 .mic-btn {
-  background-color: #f38ba8;
+  background: linear-gradient(135deg, #f38ba8 0%, #eba0ac 100%);
   color: #1e1e2e;
 }
+.mic-btn:hover {
+  background: linear-gradient(135deg, #eba0ac 0%, #f5c2e7 100%);
+  transform: translateY(-1px);
+}
 .mic-btn.recording {
-  background-color: #eba0ac;
-  animation: pulse 1.5s infinite;
+  background: linear-gradient(135deg, #f38ba8 0%, #fab387 100%);
+  animation: pulse 1.2s infinite;
+  box-shadow: 0 0 20px rgba(243, 139, 168, 0.4);
 }
 
 @keyframes pulse {
-  0% {
-    transform: scale(1);
-  }
-  50% {
-    transform: scale(1.05);
-  }
-  100% {
-    transform: scale(1);
-  }
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.03); }
 }
 
+.section {
+  margin-bottom: 16px;
+}
 .section h3 {
-  font-size: 1rem;
-  margin-bottom: 10px;
+  font-size: 0.9rem;
+  margin: 0 0 8px 0;
   color: #f5c2e7;
 }
 
+/* Progress bar */
 #progress-container {
-  height: 8px;
+  height: 6px;
   background-color: #313244;
-  border-radius: 4px;
+  border-radius: 3px;
   overflow: hidden;
-  margin-bottom: 5px;
+  margin-bottom: 4px;
 }
 #progress-bar {
   height: 100%;
   width: 0%;
-  background-color: #a6e3a1;
-  transition: width 0.3s;
+  background: linear-gradient(90deg, #a6e3a1 0%, #94e2d5 100%);
+  transition: width 0.4s ease;
+  border-radius: 3px;
 }
-
 #progress-text {
-  font-size: 0.8rem;
-  margin-top: 0;
-  margin-bottom: 10px;
+  font-size: 0.75rem;
+  margin: 0 0 8px 0;
   color: #a6adc8;
 }
 
+/* Field list */
 .field-list {
   list-style: none;
   padding: 0;
   margin: 0;
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 6px;
+  max-height: 200px;
+  overflow-y: auto;
 }
-
 .field-item {
   background-color: #313244;
   padding: 8px 10px;
-  border-radius: 4px;
-  font-size: 0.85rem;
+  border-radius: 6px;
+  font-size: 0.8rem;
+  transition: all 0.3s ease;
+}
+.field-item.filled { border-left: 4px solid #a6e3a1; }
+.field-item.pending { border-left: 4px solid #f9e2af; }
+.field-item.empty { border-left: 4px solid #6c7086; }
+
+.field-info {
   display: flex;
-  justify-content: space-between;
-  align-items: center;
+  flex-direction: column;
+  gap: 2px;
+}
+.field-label {
+  font-weight: 600;
+  color: #cdd6f4;
+}
+.field-value {
+  font-size: 0.7rem;
+  color: #a6adc8;
+}
+.field-item.filled .field-value { color: #a6e3a1; }
+.field-item.pending .field-value { color: #fab387; }
+
+/* Activity log — this is the key UX improvement */
+.activity-log {
+  background-color: #11111b;
+  border: 1px solid #313244;
+  border-radius: 8px;
+  padding: 8px;
+  max-height: 180px;
+  overflow-y: auto;
+  font-family: 'Cascadia Code', 'Fira Code', monospace, sans-serif;
+  font-size: 0.72rem;
+  line-height: 1.5;
 }
 
-.field-item.filled {
-  border-left: 4px solid #a6e3a1;
+/* Live transcript — real-time AI response bubble */
+.live-transcript {
+  background: linear-gradient(135deg, #1e1e2e 0%, #181825 100%);
+  border: 1px solid #89b4fa;
+  border-radius: 10px;
+  padding: 12px;
+  margin-bottom: 16px;
+  font-size: 0.85rem;
+  color: #cdd6f4;
+  line-height: 1.5;
+  animation: fadeIn 0.3s ease;
+  position: relative;
 }
-.field-item.pending {
-  border-left: 4px solid #f9e2af;
+.live-transcript::before {
+  content: "🤖 AI";
+  font-size: 0.65rem;
+  color: #89b4fa;
+  position: absolute;
+  top: -8px;
+  left: 12px;
+  background: #1e1e2e;
+  padding: 0 4px;
 }
-.field-item.empty {
-  border-left: 4px solid #6c7086;
+
+/* User transcript (what user said) */
+.user-transcript {
+  background: linear-gradient(135deg, #1e1e2e 0%, #181825 100%);
+  border: 1px solid #a6e3a1;
+  border-radius: 10px;
+  padding: 10px 12px;
+  margin-bottom: 8px;
+  font-size: 0.8rem;
+  color: #a6e3a1;
+  animation: fadeIn 0.3s ease;
+}
+.log-entry {
+  padding: 2px 0;
+  color: #a6adc8;
+  border-bottom: 1px solid #1e1e2e;
+  animation: fadeIn 0.3s ease;
+}
+.log-entry:last-child {
+  border-bottom: none;
+  color: #cdd6f4;
+}
+.log-time {
+  color: #585b70;
+  margin-right: 6px;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(-4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 4px;
+}
+::-webkit-scrollbar-track {
+  background: #1e1e2e;
+}
+::-webkit-scrollbar-thumb {
+  background: #45475a;
+  border-radius: 2px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #585b70;
 }

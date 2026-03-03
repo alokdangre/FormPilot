@@ -7,24 +7,37 @@
   </head>
   <body>
     <div class="header">
-      <h1>FormPilot</h1>
-      <div id="status-indicator" class="status connected">Ready</div>
+      <h1>🤖 FormPilot</h1>
+      <div id="status-indicator" class="status">Connecting...</div>
     </div>
 
     <div class="controls">
-      <button id="analyze-btn" class="btn primary">Analyze This Form</button>
-      <button id="mic-btn" class="btn mic-btn">🎤 Start Recording</button>
+      <button id="analyze-btn" class="btn primary">⚡ Analyze & Fill This Form</button>
+      <button id="mic-btn" class="btn mic-btn">🎤 Start Listening</button>
     </div>
 
+    <!-- User's speech (what they said) -->
+    <div id="user-transcript" class="user-transcript" style="display:none;"></div>
+
+    <!-- Live AI transcript (shows streaming text in real-time) -->
+    <div id="live-transcript" class="live-transcript" style="display:none;"></div>
+
     <div class="section">
-      <h3>Current Form</h3>
+      <h3>📋 Form Fields</h3>
       <div id="progress-container">
         <div id="progress-bar"></div>
       </div>
-      <p id="progress-text">0/0 fields filled</p>
-      <ul id="field-list" class="field-list">
-        <!-- Fields will be injected here -->
-      </ul>
+      <p id="progress-text">Click "Analyze" to start</p>
+      <ul id="field-list" class="field-list"></ul>
+    </div>
+
+    <div class="section">
+      <h3>📜 Activity Log</h3>
+      <div id="activity-log" class="activity-log">
+        <div class="log-entry">
+          <span class="log-time">--:--:--</span> FormPilot ready. Open a form and click Analyze.
+        </div>
+      </div>
     </div>
 
     <script src="sidepanel.js"></script>

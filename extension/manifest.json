@@ -3,7 +3,7 @@
   "name": "FormPilot",
   "version": "1.0.0",
   "description": "Voice-controlled AI that fills any web form for you",
-  "permissions": ["activeTab", "sidePanel", "tabs", "scripting"],
+  "permissions": ["activeTab", "sidePanel", "tabs", "scripting", "offscreen"],
   "host_permissions": ["<all_urls>"],
   "background": {
     "service_worker": "background/service-worker.js"
