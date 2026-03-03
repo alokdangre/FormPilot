@@ -1,56 +1,198 @@
-import json
+"""
+FormPilot Data Resolver — AI-Powered Field Matching.
 
-# Pre-populated mock profile for Phase 3 testing
-MOCK_PROFILE = {
-    "full name": "Alok Dangre",
-    "name": "Alok Dangre",
+Uses Gemini to intelligently match form fields to user profile data.
+This is GENERIC — works for ANY form, not hardcoded to specific labels.
+
+Strategy:
+1. Fast pass: match obvious fields by type (email → email, tel → phone)
+2. AI pass: send remaining unmatched fields to Gemini for semantic matching
+"""
+
+import os
+import json
+import asyncio
+import logging
+from google import genai
+from google.genai import types
+
+logger = logging.getLogger("FormPilot")
+
+# User profile — will later come from chrome.storage.local
+USER_PROFILE = {
+    "full_name": "Alok Dangre",
+    "first_name": "Alok",
+    "last_name": "Dangre",
     "email": "alokdangre@gmail.com",
-    "email address": "alokdangre@gmail.com",
     "phone": "+91 9876543210",
     "address": "123 ABC Colony",
     "city": "Mumbai",
     "state": "Maharashtra",
     "country": "India",
-    "resident of": "India",
-    "date of birth": "15/05/1999",
-    "project id": "formpilot-hackathon-1234",
-    "user id": "alokd-devpost-77",
-    "initial idea": "I am building FormPilot, an autonomous browser agent that uses Gemini Vision and Computer Use along with Google ADK to dynamically fill complex forms via voice commands without relying on fragile DOM selectors. I plan to build this under the UI Navigator category."
+    "date_of_birth": "15/05/1999",
+    "google_cloud_project_id": "formpilot-hackathon-1234",
+    "google_cloud_email": "alokdangre@gmail.com",
+    "has_google_cloud_account": "Yes",
+    "devpost_email": "alokdangre@gmail.com",
+    "hackathon_idea": "I am building FormPilot, an autonomous browser agent that uses Gemini Vision and Computer Use along with Google ADK to dynamically fill complex forms via voice commands without relying on fragile DOM selectors. I plan to build this under the UI Navigator category.",
 }
+
 
 def resolve_field_data(merged_fields: list) -> list:
     """
-    Receives fields reconciled by FormAnalyzer and assigns
-    the absolute correct value from the user's profile.
+    Two-pass resolver:
+    Pass 1 — Fast type-based matching for obvious fields
+    Pass 2 — AI-powered semantic matching for remaining fields
     """
     resolved = []
+    unmatched_indices = []
     
-    for f in merged_fields:
-        label_lower = str(f["label"]).lower()
-        matched_value = None
+    for i, f in enumerate(merged_fields):
+        label = str(f.get("label", "")).lower().strip()
+        field_type = str(f.get("type", "text")).lower()
         
-        # Simple intelligent string matching
-        for key, value in MOCK_PROFILE.items():
-            if key in label_lower or key.replace(" ", "") in label_lower.replace(" ", ""):
-                matched_value = value
-                # Stop on first strongest match
-                if len(key) > 4: 
-                    break
+        # Pass 1: Fast match by field type + simple keyword
+        value = _fast_match(label, field_type)
         
-        # Category specific logic for known Hackathon edgecases
-        if not matched_value:
-             if "category" in label_lower or "2-3 sentences" in label_lower:
-                  matched_value = MOCK_PROFILE["initial idea"]
-        
-        if matched_value:
-            f["resolved_value"] = matched_value
-            f["status"] = "matched" # Found securely in profile
+        if value is not None:
+            f["resolved_value"] = value
+            f["status"] = "matched"
             f["needs_user_input"] = False
         else:
             f["resolved_value"] = ""
-            f["status"] = "pending" # Needs ADK voice interaction (Phase 5)
+            f["status"] = "pending"
             f["needs_user_input"] = True
-            
-        resolved.append(f)
+            unmatched_indices.append(i)
         
+        resolved.append(f)
+    
+    # Pass 2: If there are unmatched fields, use AI
+    if unmatched_indices:
+        try:
+            ai_matches = _ai_match([resolved[i] for i in unmatched_indices])
+            for idx, match_value in zip(unmatched_indices, ai_matches):
+                if match_value:
+                    resolved[idx]["resolved_value"] = match_value
+                    resolved[idx]["status"] = "matched"
+                    resolved[idx]["needs_user_input"] = False
+        except Exception as e:
+            logger.warning(f"AI matching failed, leaving fields as pending: {e}")
+    
     return resolved
+
+
+def _fast_match(label: str, field_type: str) -> str | None:
+    """
+    Fast keyword-based matching. Works for common field types.
+    Returns None if no confident match.
+    """
+    profile = USER_PROFILE
+    
+    # Type-based: if the HTML input type tells us what it wants
+    if field_type == "tel":
+        return profile["phone"]
+    if field_type == "date":
+        return profile["date_of_birth"]
+    
+    # Email fields — but need context from label to pick the right email
+    if field_type == "email" or (field_type == "text" and label in ("email", "email address", "your email", "your email address")):
+        return profile["email"]
+    
+    # Name fields
+    if label in ("name", "full name", "your name", "full_name"):
+        return profile["full_name"]
+    if "first name" in label and "last" not in label:
+        return profile["first_name"]
+    if "last name" in label:
+        return profile["last_name"]
+    
+    # Phone
+    if any(kw in label for kw in ("phone", "mobile", "telephone", "cell")):
+        return profile["phone"]
+    
+    # Address
+    if label in ("address", "street address", "your address"):
+        return profile["address"]
+    if label in ("city", "your city"):
+        return profile["city"]
+    if label in ("state", "province", "your state"):
+        return profile["state"]
+    
+    # Country — very common
+    if "country" in label or "resident" in label:
+        return profile["country"]
+    
+    # No confident fast match
+    return None
+
+
+def _ai_match(unmatched_fields: list) -> list:
+    """
+    Use Gemini to semantically match form fields to profile data.
+    Sends ONE API call for ALL unmatched fields at once.
+    """
+    client = genai.Client()
+    
+    # Build the prompt
+    fields_desc = []
+    for i, f in enumerate(unmatched_fields):
+        field_type = f.get("type", "text")
+        options = f.get("options", [])
+        options_str = ""
+        if options:
+            opt_texts = [o.get("text", o.get("value", str(o))) if isinstance(o, dict) else str(o) for o in options]
+            options_str = f" Options: {opt_texts}"
+        fields_desc.append(f'{i+1}. Label: "{f.get("label", "")}" | Type: {field_type}{options_str}')
+    
+    fields_text = "\n".join(fields_desc)
+    
+    profile_text = json.dumps(USER_PROFILE, indent=2)
+    
+    prompt = f"""You are a form-filling assistant. Match these form fields to user profile data.
+
+FORM FIELDS (unmatched):
+{fields_text}
+
+USER PROFILE:
+{profile_text}
+
+INSTRUCTIONS:
+- For each field, return the EXACT value from the profile that should go in that field.
+- If a field asks a yes/no question, answer based on the profile data.
+- If a field has options (radio/select), pick the matching option text.
+- If no profile data matches, return empty string "".
+- Return ONLY a JSON array of strings, one per field, in order.
+- Example: ["value1", "Yes", "", "India"]
+
+IMPORTANT: Return ONLY the JSON array, nothing else."""
+
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.1,  # Low temperature for deterministic matching
+                response_mime_type="application/json",
+            )
+        )
+        
+        result_text = response.text.strip()
+        # Parse JSON array
+        values = json.loads(result_text)
+        
+        if isinstance(values, list) and len(values) == len(unmatched_fields):
+            logger.info(f"AI matched {sum(1 for v in values if v)} of {len(values)} fields")
+            return values
+        else:
+            logger.warning(f"AI returned wrong format: {result_text[:200]}")
+            return [""] * len(unmatched_fields)
+            
+    except Exception as e:
+        logger.error(f"AI matching error: {e}")
+        return [""] * len(unmatched_fields)
+
+
+async def resolve_field_data_async(merged_fields: list) -> list:
+    """Async version — runs AI matching in executor to avoid blocking."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, resolve_field_data, merged_fields)
