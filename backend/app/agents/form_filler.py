@@ -5,13 +5,16 @@ def build_fill_commands(resolved_fields: list) -> list:
     """
     commands = []
     
-    for field in resolved_fields:
+    for i, field in enumerate(resolved_fields):
         if field.get("status") == "matched" and field.get("resolved_value"):
             commands.append({
                 "type": "FILL_FIELD",
-                "selector": field.get("selector"),
+                "selector": field.get("selector"),   # CSS selector (may be None in vision-only)
                 "value": field.get("resolved_value"),
-                "label": field.get("label")
+                "label": field.get("label"),
+                "name": field.get("name", ""),        # HTML name attribute
+                "fieldType": field.get("type", "text"),  # text/email/radio/select/textarea
+                "fieldIndex": field.get("index", i),  # Original DOM order index
             })
             
     return commands
