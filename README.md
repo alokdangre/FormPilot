@@ -27,6 +27,7 @@ FormPilot runs as a two-piece architecture:
 2.  **FastAPI + ADK Backend (Cloud Run)**: A Python WebSocket server hosting the Google ADK Orchestrator and sub-agents.
 
 For a detailed visual breakdown, see [docs/architecture.md](docs/architecture.md).
+For the full code-level map of agents, tools, functions, messages, and click flows, see [docs/agent-tool-function-map.md](docs/agent-tool-function-map.md).
 
 ## 💻 Local Setup
 

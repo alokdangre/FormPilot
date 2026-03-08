@@ -66,25 +66,6 @@ h1 {
   box-shadow: 0 4px 12px rgba(137, 180, 250, 0.3);
 }
 
-.mic-btn {
-  background: linear-gradient(135deg, #f38ba8 0%, #eba0ac 100%);
-  color: #1e1e2e;
-}
-.mic-btn:hover {
-  background: linear-gradient(135deg, #eba0ac 0%, #f5c2e7 100%);
-  transform: translateY(-1px);
-}
-.mic-btn.recording {
-  background: linear-gradient(135deg, #f38ba8 0%, #fab387 100%);
-  animation: pulse 1.2s infinite;
-  box-shadow: 0 0 20px rgba(243, 139, 168, 0.4);
-}
-
-@keyframes pulse {
-  0%, 100% { transform: scale(1); }
-  50% { transform: scale(1.03); }
-}
-
 .section {
   margin-bottom: 16px;
 }
@@ -164,6 +145,32 @@ h1 {
   font-family: 'Cascadia Code', 'Fira Code', monospace, sans-serif;
   font-size: 0.72rem;
   line-height: 1.5;
+}
+
+.heard-log {
+  background-color: #11111b;
+  border: 1px solid #2d4f3d;
+  border-radius: 8px;
+  padding: 8px;
+  max-height: 120px;
+  overflow-y: auto;
+  font-family: 'Cascadia Code', 'Fira Code', monospace, sans-serif;
+  font-size: 0.74rem;
+  line-height: 1.5;
+}
+
+.heard-entry {
+  padding: 4px 0;
+  border-bottom: 1px solid #1e1e2e;
+  color: #a6e3a1;
+}
+
+.heard-entry:last-child {
+  border-bottom: none;
+}
+
+.heard-entry.muted {
+  color: #6c7086;
 }
 
 /* Live transcript — real-time AI response bubble */

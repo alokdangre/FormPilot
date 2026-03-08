@@ -88,7 +88,19 @@ async def live_endpoint(websocket: WebSocket, user_id: str, session_id: str):
         response_modalities=["AUDIO"],
         input_audio_transcription=types.AudioTranscriptionConfig(),
         output_audio_transcription=types.AudioTranscriptionConfig(),
+        # Gemini API rejects transparent session resumption; default config is safe.
         session_resumption=types.SessionResumptionConfig(),
+        realtime_input_config=types.RealtimeInputConfig(
+            automatic_activity_detection=types.AutomaticActivityDetection(
+                start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_HIGH,
+                end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_LOW,
+                prefix_padding_ms=80,
+                silence_duration_ms=550,
+            ),
+            activity_handling=types.ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
+            turn_coverage=types.TurnCoverage.TURN_INCLUDES_ONLY_ACTIVITY,
+        ),
+        proactivity=types.ProactivityConfig(proactive_audio=True),
     )
 
     session = await session_service.get_session(

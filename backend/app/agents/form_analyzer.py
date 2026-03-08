@@ -22,18 +22,47 @@ def dom_fields_are_sufficient(dom_fields: list) -> bool:
     """Check if DOM extraction gave us enough labeled fields to skip Vision."""
     if not dom_fields or len(dom_fields) == 0:
         return False
-    
+
+    high_confidence_sources = {
+        "labels-api",
+        "label-for",
+        "label-wrapper",
+        "fieldset-legend",
+        "aria-labelledby",
+        "aria-label",
+        "group-container",
+        "nearby-question",
+    }
+    fallback_sources = {"placeholder", "name", "id", "unknown"}
+
     labeled = 0
+    high_confidence = 0
+    fallback_only = 0
+
     for f in dom_fields:
-        label = f.get("label", "")
-        # If label is real (not "Unknown field", not empty, not just the input name)
+        label = str(f.get("label", "")).strip()
+        source = str(f.get("label_source", "")).strip()
+
         if label and "Unknown" not in label and len(label) > 2:
             labeled += 1
-    
-    # If 70%+ of fields have real labels, DOM is sufficient
-    ratio = labeled / len(dom_fields) if dom_fields else 0
-    print(f"[FormAnalyzer] DOM label quality: {labeled}/{len(dom_fields)} ({ratio:.0%})")
-    return ratio >= 0.7
+
+        if source in high_confidence_sources:
+            high_confidence += 1
+        elif source in fallback_sources:
+            fallback_only += 1
+
+    label_ratio = labeled / len(dom_fields) if dom_fields else 0
+    confidence_ratio = high_confidence / len(dom_fields) if dom_fields else 0
+    print(
+        "[FormAnalyzer] DOM quality: "
+        f"labels={labeled}/{len(dom_fields)} ({label_ratio:.0%}), "
+        f"high_confidence={high_confidence}/{len(dom_fields)} ({confidence_ratio:.0%}), "
+        f"fallback_only={fallback_only}"
+    )
+
+    # Treat DOM as sufficient when most fields have meaningful labels and
+    # at least a majority came from structural sources instead of fallback text.
+    return label_ratio >= 0.85 and confidence_ratio >= 0.6
 
 
 async def call_gemini_vision_async(screenshot_b64: str) -> List[dict]:
@@ -114,7 +143,8 @@ def reconcile_fields(dom_fields: list, vision_fields: list) -> list:
                 label = vision_fields[v_idx].get("label", "Unknown field")
                 v_idx += 1
                 
-        merged.append({
+        merged_field = dict(dom)
+        merged_field.update({
             "selector": dom.get("selector"),
             "label": label,
             "type": dom.get("type", "text"),
@@ -122,6 +152,7 @@ def reconcile_fields(dom_fields: list, vision_fields: list) -> list:
             "required": dom.get("required", False),
             "options": dom.get("options", []),
         })
+        merged.append(merged_field)
         
     return merged
 

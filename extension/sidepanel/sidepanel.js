@@ -1,12 +1,17 @@
 let isRecording = false;
 let streamingText = ""; // Accumulates streaming text from ADK
+let liveConnected = false;
+let currentAnalyzedFields = [];
+let lastVoiceKickoffKey = "";
+let lastAutoVerifyKey = "";
+let playbackContext = null;
+let playbackCursorTime = 0;
+let pendingVoiceStart = false;
 
 document.addEventListener('DOMContentLoaded', () => {
     const analyzeBtn = document.getElementById('analyze-btn');
-    const micBtn = document.getElementById('mic-btn');
 
     analyzeBtn.addEventListener('click', handleAnalyze);
-    micBtn.addEventListener('click', toggleRecording);
 
     // Listen for messages from service worker
     chrome.runtime.onMessage.addListener((msg, sender) => {
@@ -17,8 +22,13 @@ document.addEventListener('DOMContentLoaded', () => {
             updateStatus(msg.connected ? "Connected" : "Reconnecting...", msg.connected);
         }
         if (msg.type === "LIVE_STATUS") {
+            liveConnected = !!msg.connected;
             if (msg.connected) {
+                pendingVoiceStart = false;
                 addActivityLog("🟢 Live voice connection established");
+                maybeKickoffVoiceFormFlow();
+            } else if (pendingVoiceStart) {
+                addActivityLog("⚠️ Live voice connection dropped.");
             }
         }
 
@@ -30,16 +40,23 @@ document.addEventListener('DOMContentLoaded', () => {
 
         // ── Form analysis complete ──
         if (msg.type === "FORM_ANALYZED") {
+            currentAnalyzedFields = msg.fields || [];
+            lastVoiceKickoffKey = "";
+            lastAutoVerifyKey = "";
+            resetHeardLog();
             document.getElementById('analyze-btn').innerText = "⚡ Re-Analyze & Fill";
             document.getElementById('analyze-btn').disabled = false;
             updateStatus("Ready to Fill", true);
-            updateResolvedFieldList(msg.fields);
+            updateResolvedFieldList(currentAnalyzedFields);
 
             if (msg.fill_commands && msg.fill_commands.length > 0) {
                 addActivityLog(`Starting to fill ${msg.fill_commands.length} fields...`);
-                executeFillCommands(msg.fill_commands, msg.fields);
+                executeFillCommands(msg.fill_commands, currentAnalyzedFields);
+            } else if (hasPendingFields()) {
+                addActivityLog("No fields to auto-fill. Starting voice completion...");
+                maybeStartAutonomousVoiceSession();
             } else {
-                addActivityLog("No fields to auto-fill. Use voice to provide missing data.");
+                addActivityLog("✅ Nothing is pending.");
             }
         }
 
@@ -48,6 +65,7 @@ document.addEventListener('DOMContentLoaded', () => {
             if (msg.finished) {
                 // Final transcription — show in activity log
                 addActivityLog(`🎤 You: "${msg.text}"`);
+                addHeardLog(msg.text);
             }
             updateUserTranscript(msg.text, msg.finished);
         }
@@ -64,6 +82,19 @@ document.addEventListener('DOMContentLoaded', () => {
             }
             // NOTE: Native audio models handle their own audio output.
             // We do NOT use SpeechSynthesis — the AI speaks directly.
+        }
+
+        if (msg.type === "AUDIO_PLAYBACK") {
+            playAudioChunk(msg.data, msg.mimeType);
+        }
+
+        if (msg.type === "VOICE_FIELD_FILLED") {
+            applyVoiceFillToFieldList(msg.label, msg.value);
+            addActivityLog(`✅ Voice filled: ${msg.label}`);
+        }
+
+        if (msg.type === "VOICE_FIELD_FILL_FAILED") {
+            addActivityLog(`⚠️ Voice fill failed: ${msg.label || 'field'}`);
         }
 
         // ── Turn complete (AI finished responding) ──
@@ -85,7 +116,24 @@ document.addEventListener('DOMContentLoaded', () => {
                 addActivityLog("✅ All fields verified correctly!");
             } else {
                 updateStatus("⚠️ Issues Found", true);
-                addActivityLog(`⚠️ ${msg.result?.issues?.length || 0} issue(s) found.`);
+                const issues = msg.result?.issues || [];
+                addActivityLog(`⚠️ ${issues.length} issue(s) found.`);
+                issues.forEach((issue) => {
+                    const field = issue?.field || issue?.label || "Unknown field";
+                    const expected = issue?.expected || issue?.value_we_injected || "";
+                    const actual = issue?.actual || "";
+                    const error = issue?.error || "";
+
+                    if (error) {
+                        addActivityLog(`⚠️ Verify error: ${error}`);
+                        return;
+                    }
+
+                    const parts = [`⚠️ ${field}`];
+                    if (expected) parts.push(`expected "${expected}"`);
+                    if (actual) parts.push(`saw "${actual}"`);
+                    addActivityLog(parts.join(" — "));
+                });
             }
         }
     });
@@ -114,6 +162,29 @@ function addActivityLog(message) {
     log.scrollTop = log.scrollHeight;
 }
 
+function addHeardLog(message) {
+    const log = document.getElementById('heard-log');
+    if (!log || !message) return;
+
+    const muted = log.querySelector('.heard-entry.muted');
+    if (muted) muted.remove();
+
+    const entry = document.createElement('div');
+    entry.className = 'heard-entry';
+    const time = new Date().toLocaleTimeString('en-US', {
+        hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit'
+    });
+    entry.textContent = `${time} ${message}`;
+    log.appendChild(entry);
+    log.scrollTop = log.scrollHeight;
+}
+
+function resetHeardLog() {
+    const log = document.getElementById('heard-log');
+    if (!log) return;
+    log.innerHTML = '<div class="heard-entry muted">Your speech-to-text transcript will appear here.</div>';
+}
+
 function updateLiveTranscript(text) {
     const el = document.getElementById('live-transcript');
     if (el) {
@@ -133,12 +204,66 @@ function updateUserTranscript(text, finished) {
     }
 }
 
+function ensurePlaybackContext() {
+    if (!playbackContext) {
+        playbackContext = new AudioContext();
+    }
+    if (playbackContext.state === 'suspended') {
+        playbackContext.resume().catch(() => { });
+    }
+    if (playbackCursorTime < playbackContext.currentTime) {
+        playbackCursorTime = playbackContext.currentTime;
+    }
+    return playbackContext;
+}
+
+function playAudioChunk(base64Data, mimeType) {
+    if (!base64Data) return;
+
+    const ctx = ensurePlaybackContext();
+    const pcmBuffer = base64ToArrayBuffer(base64Data);
+    const sampleRate = parseSampleRate(mimeType);
+    const audioBuffer = pcm16ToAudioBuffer(ctx, pcmBuffer, sampleRate);
+    const source = ctx.createBufferSource();
+    source.buffer = audioBuffer;
+    source.connect(ctx.destination);
+
+    const startAt = Math.max(playbackCursorTime, ctx.currentTime);
+    source.start(startAt);
+    playbackCursorTime = startAt + audioBuffer.duration;
+}
+
+function parseSampleRate(mimeType) {
+    const match = /rate=(\d+)/i.exec(mimeType || '');
+    return match ? Number(match[1]) : 24000;
+}
+
+function base64ToArrayBuffer(base64) {
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+        bytes[i] = binary.charCodeAt(i);
+    }
+    return bytes.buffer;
+}
+
+function pcm16ToAudioBuffer(ctx, buffer, sampleRate) {
+    const pcm = new Int16Array(buffer);
+    const audioBuffer = ctx.createBuffer(1, pcm.length, sampleRate);
+    const channel = audioBuffer.getChannelData(0);
+    for (let i = 0; i < pcm.length; i++) {
+        channel[i] = pcm[i] / 0x8000;
+    }
+    return audioBuffer;
+}
+
 // ═══════════════════════════════════════════════════
 // Form Analysis
 // ═══════════════════════════════════════════════════
 
 async function handleAnalyze() {
     const analyzeBtn = document.getElementById('analyze-btn');
+    ensurePlaybackContext();
     analyzeBtn.innerText = "Analyzing...";
     analyzeBtn.disabled = true;
     addActivityLog("📸 Capturing screenshot...");
@@ -224,6 +349,7 @@ async function executeFillCommands(commands, originalFields) {
                 chrome.tabs.sendMessage(tabs[0].id, cmd, (resp) => {
                     if (resp && resp.success) {
                         filledCount++;
+                        applyFilledCommandToFieldList(cmd);
                         updateFillProgress(filledCount, commands.length);
                         addActivityLog(`✅ Filled: ${cmd.label || 'field'}`);
                     } else {
@@ -235,20 +361,13 @@ async function executeFillCommands(commands, originalFields) {
         }
 
         addActivityLog(`🎉 Done! Filled ${filledCount}/${commands.length} fields.`);
+        if (hasPendingFields()) {
+            addActivityLog("🎤 Switching to voice for the remaining fields...");
+            maybeStartAutonomousVoiceSession();
+            return;
+        }
 
-        // Auto-verify
-        setTimeout(() => {
-            addActivityLog("🔍 Verifying...");
-            chrome.runtime.sendMessage({ type: "CAPTURE_SCREENSHOT" }, (response) => {
-                if (!chrome.runtime.lastError && response?.dataUrl) {
-                    chrome.runtime.sendMessage({
-                        type: "SEND_VERIFY",
-                        screenshot: response.dataUrl,
-                        fields: originalFields
-                    });
-                }
-            });
-        }, 1500);
+        triggerVerification(originalFields, "🔍 Verifying...");
     });
 }
 
@@ -287,31 +406,128 @@ function updateResolvedFieldList(fields) {
     });
 }
 
+function applyVoiceFillToFieldList(label, value) {
+    if (!currentAnalyzedFields.length || !label) return;
+
+    const target = currentAnalyzedFields.find((field) => {
+        const fieldLabel = (field.label || '').toLowerCase().trim();
+        const desired = String(label || '').toLowerCase().trim();
+        return fieldLabel === desired || fieldLabel.includes(desired) || desired.includes(fieldLabel);
+    });
+
+    if (!target) return;
+
+    target.resolved_value = value;
+    target.current_value = value;
+    target.status = 'matched';
+    target.needs_user_input = false;
+    updateResolvedFieldList(currentAnalyzedFields);
+
+    maybeVerifyVoiceCompletion();
+}
+
+function applyFilledCommandToFieldList(cmd) {
+    if (!cmd) return;
+
+    const target = currentAnalyzedFields.find((field) => {
+        if (cmd.selector && field.selector && field.selector === cmd.selector) return true;
+        if (cmd.name && field.name && field.name === cmd.name) return true;
+
+        const fieldLabel = String(field.label || '').toLowerCase().trim();
+        const desired = String(cmd.label || '').toLowerCase().trim();
+        return desired && (fieldLabel === desired || fieldLabel.includes(desired) || desired.includes(fieldLabel));
+    });
+
+    if (!target) return;
+
+    target.resolved_value = cmd.value;
+    target.current_value = cmd.value;
+    target.status = 'matched';
+    target.needs_user_input = false;
+    updateResolvedFieldList(currentAnalyzedFields);
+}
+
+function hasPendingFields() {
+    return currentAnalyzedFields.some((field) => field.status !== 'matched');
+}
+
+function maybeKickoffVoiceFormFlow() {
+    if (!isRecording || !liveConnected) return;
+
+    const pendingFields = currentAnalyzedFields.filter((field) => field.status !== 'matched');
+    if (!pendingFields.length) return;
+
+    const kickoffKey = pendingFields
+        .map((field) => `${field.label}:${field.status}:${field.resolved_value || ''}`)
+        .join('|');
+
+    if (kickoffKey && kickoffKey === lastVoiceKickoffKey) return;
+    lastVoiceKickoffKey = kickoffKey;
+
+    chrome.runtime.sendMessage({
+        type: "SEND_TEXT_TO_LIVE",
+        text: "A form is already analyzed. Start voice-guided completion now. Ask exactly one pending field at a time, wait for my answer, fill it immediately, and continue until no pending fields remain."
+    });
+}
+
+function maybeStartAutonomousVoiceSession() {
+    if (!hasPendingFields()) return;
+    if (isRecording) {
+        maybeKickoffVoiceFormFlow();
+        return;
+    }
+
+    pendingVoiceStart = true;
+    ensurePlaybackContext();
+    updateStatus("Starting voice...", true);
+    addActivityLog("🎤 Starting autonomous voice completion...");
+
+    chrome.runtime.sendMessage({ type: "START_MIC" }, (resp) => {
+        if (chrome.runtime.lastError || !resp?.success) {
+            pendingVoiceStart = false;
+            updateStatus("Voice start failed", false);
+            addActivityLog("❌ Voice start failed. Check extension microphone permission.");
+            return;
+        }
+
+        isRecording = true;
+        pendingVoiceStart = false;
+        streamingText = "";
+        updateStatus("Listening...", true);
+        addActivityLog("🎤 Listening for your answer...");
+        maybeKickoffVoiceFormFlow();
+    });
+}
+
+function maybeVerifyVoiceCompletion() {
+    if (hasPendingFields()) return;
+
+    const verifyKey = currentAnalyzedFields
+        .map((field) => `${field.label}:${field.resolved_value || ''}`)
+        .join('|');
+
+    if (!verifyKey || verifyKey === lastAutoVerifyKey) return;
+    lastAutoVerifyKey = verifyKey;
+
+    triggerVerification(currentAnalyzedFields, "🔍 Verifying voice-filled form...");
+}
+
+function triggerVerification(fields, logMessage) {
+    if (logMessage) {
+        addActivityLog(logMessage);
+    }
+
+    chrome.runtime.sendMessage({ type: "CAPTURE_SCREENSHOT" }, (response) => {
+        if (!chrome.runtime.lastError && response?.dataUrl) {
+            chrome.runtime.sendMessage({
+                type: "SEND_VERIFY",
+                screenshot: response.dataUrl,
+                fields: fields
+            });
+        }
+    });
+}
+
 // ═══════════════════════════════════════════════════
 // Microphone (via Offscreen → Live WS)
 // ═══════════════════════════════════════════════════
-
-async function toggleRecording() {
-    const micBtn = document.getElementById('mic-btn');
-
-    if (!isRecording) {
-        addActivityLog("🎤 Starting voice connection...");
-        chrome.runtime.sendMessage({ type: "START_MIC" }, (resp) => {
-            if (chrome.runtime.lastError || !resp?.success) {
-                addActivityLog("❌ Mic failed. Check extension permissions.");
-                return;
-            }
-            isRecording = true;
-            streamingText = "";
-            micBtn.textContent = '⏹ Stop Listening';
-            micBtn.classList.add('recording');
-            addActivityLog("🎤 Listening... speak naturally!");
-        });
-    } else {
-        chrome.runtime.sendMessage({ type: "STOP_MIC" });
-        isRecording = false;
-        micBtn.textContent = '🎤 Start Listening';
-        micBtn.classList.remove('recording');
-        addActivityLog("🎤 Stopped listening");
-    }
-}

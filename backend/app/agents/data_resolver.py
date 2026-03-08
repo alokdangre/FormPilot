@@ -18,24 +18,10 @@ from google.genai import types
 
 logger = logging.getLogger("FormPilot")
 
-# User profile — will later come from chrome.storage.local
-USER_PROFILE = {
-    "full_name": "Alok Dangre",
-    "first_name": "Alok",
-    "last_name": "Dangre",
-    "email": "alokdangre@gmail.com",
-    "phone": "+91 9876543210",
-    "address": "123 ABC Colony",
-    "city": "Mumbai",
-    "state": "Maharashtra",
-    "country": "India",
-    "date_of_birth": "15/05/1999",
-    "google_cloud_project_id": "formpilot-hackathon-1234",
-    "google_cloud_email": "alokdangre@gmail.com",
-    "has_google_cloud_account": "Yes",
-    "devpost_email": "alokdangre@gmail.com",
-    "hackathon_idea": "I am building FormPilot, an autonomous browser agent that uses Gemini Vision and Computer Use along with Google ADK to dynamically fill complex forms via voice commands without relying on fragile DOM selectors. I plan to build this under the UI Navigator category.",
-}
+# User profile is empty by default so the agent asks the user for info
+USER_PROFILE = {}
+BOOLEAN_TRUE = {"true", "yes", "y", "1", "on", "checked"}
+BOOLEAN_FALSE = {"false", "no", "n", "0", "off", "unchecked"}
 
 
 def resolve_field_data(merged_fields: list) -> list:
@@ -52,7 +38,8 @@ def resolve_field_data(merged_fields: list) -> list:
         field_type = str(f.get("type", "text")).lower()
         
         # Pass 1: Fast match by field type + simple keyword
-        value = _fast_match(label, field_type)
+        value = _fast_match(label, field_type, f)
+        value = _sanitize_match_value(f, value)
         
         if value is not None:
             f["resolved_value"] = value
@@ -67,12 +54,13 @@ def resolve_field_data(merged_fields: list) -> list:
         resolved.append(f)
     
     # Pass 2: If there are unmatched fields, use AI
-    if unmatched_indices:
+    if unmatched_indices and _has_meaningful_profile_data():
         try:
             ai_matches = _ai_match([resolved[i] for i in unmatched_indices])
             for idx, match_value in zip(unmatched_indices, ai_matches):
-                if match_value:
-                    resolved[idx]["resolved_value"] = match_value
+                sanitized_value = _sanitize_match_value(resolved[idx], match_value)
+                if sanitized_value:
+                    resolved[idx]["resolved_value"] = sanitized_value
                     resolved[idx]["status"] = "matched"
                     resolved[idx]["needs_user_input"] = False
         except Exception as e:
@@ -81,48 +69,126 @@ def resolve_field_data(merged_fields: list) -> list:
     return resolved
 
 
-def _fast_match(label: str, field_type: str) -> str | None:
+def _fast_match(label: str, field_type: str, field: dict | None = None) -> str | None:
     """
     Fast keyword-based matching. Works for common field types.
     Returns None if no confident match.
     """
     profile = USER_PROFILE
+    field = field or {}
+    semantic_type = str(field.get("semantic_type", "")).lower().strip()
+
+    if not profile:
+        return None
     
     # Type-based: if the HTML input type tells us what it wants
-    if field_type == "tel":
-        return profile["phone"]
-    if field_type == "date":
-        return profile["date_of_birth"]
+    if field_type == "tel" or semantic_type == "tel":
+        return profile.get("phone")
+    if field_type == "date" or semantic_type == "date":
+        return profile.get("date_of_birth")
     
     # Email fields — but need context from label to pick the right email
-    if field_type == "email" or (field_type == "text" and label in ("email", "email address", "your email", "your email address")):
-        return profile["email"]
+    if field_type == "email" or semantic_type == "email" or (field_type == "text" and label in ("email", "email address", "your email", "your email address")):
+        return profile.get("email")
     
     # Name fields
     if label in ("name", "full name", "your name", "full_name"):
-        return profile["full_name"]
+        return profile.get("full_name")
     if "first name" in label and "last" not in label:
-        return profile["first_name"]
+        return profile.get("first_name")
     if "last name" in label:
-        return profile["last_name"]
+        return profile.get("last_name")
     
     # Phone
     if any(kw in label for kw in ("phone", "mobile", "telephone", "cell")):
-        return profile["phone"]
+        return profile.get("phone")
     
     # Address
-    if label in ("address", "street address", "your address"):
-        return profile["address"]
-    if label in ("city", "your city"):
-        return profile["city"]
-    if label in ("state", "province", "your state"):
-        return profile["state"]
+    if semantic_type == "street-address" or label in ("address", "street address", "your address"):
+        return profile.get("address")
+    if semantic_type == "city" or label in ("city", "your city"):
+        return profile.get("city")
+    if semantic_type in ("state", "province") or label in ("state", "province", "your state"):
+        return profile.get("state")
     
     # Country — very common
-    if "country" in label or "resident" in label:
-        return profile["country"]
+    if semantic_type == "country" or "country" in label or "resident" in label:
+        return profile.get("country")
     
     # No confident fast match
+    return None
+
+
+def _has_meaningful_profile_data() -> bool:
+    return any(str(value).strip() for value in USER_PROFILE.values())
+
+
+def _sanitize_match_value(field: dict, value: str | None) -> str | None:
+    if value is None:
+        return None
+
+    normalized_value = str(value).strip()
+    if not normalized_value:
+        return None
+
+    options = field.get("options", []) or []
+    if not options:
+        return normalized_value
+
+    option_pairs = []
+    for option in options:
+        if isinstance(option, dict):
+            text = str(option.get("text", "")).strip()
+            raw_value = str(option.get("value", text)).strip()
+        else:
+            text = str(option).strip()
+            raw_value = text
+
+        if text or raw_value:
+            option_pairs.append((text, raw_value))
+
+    if not option_pairs:
+        return normalized_value
+
+    desired = normalized_value.lower()
+    desired_bool = _canonical_boolean(desired)
+
+    exact_text = next((text for text, _ in option_pairs if text and text.lower() == desired), None)
+    if exact_text:
+        return exact_text
+
+    exact_value = next((text or raw for text, raw in option_pairs if raw and raw.lower() == desired), None)
+    if exact_value:
+        return exact_value
+
+    if desired_bool is not None:
+        bool_match = next(
+            (
+                text or raw
+                for text, raw in option_pairs
+                if _canonical_boolean(text.lower()) == desired_bool or _canonical_boolean(raw.lower()) == desired_bool
+            ),
+            None,
+        )
+        if bool_match:
+            return bool_match
+
+    fuzzy_match = next(
+        (
+            text or raw
+            for text, raw in option_pairs
+            if (text and desired in text.lower()) or (raw and desired in raw.lower())
+        ),
+        None,
+    )
+    return fuzzy_match
+
+
+def _canonical_boolean(value: str) -> str | None:
+    if value in BOOLEAN_TRUE:
+        return "true"
+    if value in BOOLEAN_FALSE:
+        return "false"
     return None
 
 
@@ -132,6 +198,8 @@ def _ai_match(unmatched_fields: list) -> list:
     Sends ONE API call for ALL unmatched fields at once.
     """
     client = genai.Client()
+    if not _has_meaningful_profile_data():
+        return [""] * len(unmatched_fields)
     
     # Build the prompt
     fields_desc = []
@@ -142,7 +210,9 @@ def _ai_match(unmatched_fields: list) -> list:
         if options:
             opt_texts = [o.get("text", o.get("value", str(o))) if isinstance(o, dict) else str(o) for o in options]
             options_str = f" Options: {opt_texts}"
-        fields_desc.append(f'{i+1}. Label: "{f.get("label", "")}" | Type: {field_type}{options_str}')
+        semantic_type = f.get("semantic_type", "")
+        semantic_str = f" | Semantic: {semantic_type}" if semantic_type else ""
+        fields_desc.append(f'{i+1}. Label: "{f.get("label", "")}" | Type: {field_type}{semantic_str}{options_str}')
     
     fields_text = "\n".join(fields_desc)
     
@@ -161,6 +231,7 @@ INSTRUCTIONS:
 - If a field asks a yes/no question, answer based on the profile data.
 - If a field has options (radio/select), pick the matching option text.
 - If no profile data matches, return empty string "".
+- Never guess values that are not supported by the profile.
 - Return ONLY a JSON array of strings, one per field, in order.
 - Example: ["value1", "Yes", "", "India"]
 

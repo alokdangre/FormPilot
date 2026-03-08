@@ -1,401 +1,1128 @@
+const EXCLUDED_INPUT_TYPES = new Set([
+    "hidden",
+    "submit",
+    "button",
+    "image",
+    "reset",
+]);
+
+const EXTRACTABLE_ROLES = new Set([
+    "textbox",
+    "searchbox",
+    "combobox",
+    "listbox",
+    "checkbox",
+    "radio",
+    "switch",
+    "spinbutton",
+]);
+
+const TRUTHY_VALUES = new Set(["true", "yes", "1", "on", "checked"]);
+const FALSY_VALUES = new Set(["false", "no", "0", "off", "unchecked"]);
+const BOOLEAN_ALIASES = new Map([
+    ["true", ["true", "yes", "y", "1", "on", "checked"]],
+    ["false", ["false", "no", "n", "0", "off", "unchecked"]],
+]);
+
+// Track which DOM elements have been filled in this session.
+const _filledElements = new Set();
+let _formPilotElementCounter = 0;
+
 function extractFormFields() {
     const fields = [];
-    const inputs = document.querySelectorAll("input, select, textarea");
-    const radioGroups = {};  // Group radios by name
+    const radioGroups = new Map();
+    let outputIndex = 0;
 
-    inputs.forEach((el, index) => {
-        // Ignore hidden or completely useless fields
-        if (el.type === 'hidden' || !isElementVisible(el)) return;
+    for (const el of collectFormControls(document)) {
+        const descriptor = buildFieldDescriptor(el, outputIndex);
+        if (!descriptor) continue;
 
-        // Ignore button type inputs
-        if (['submit', 'button', 'image', 'reset'].includes(el.type)) return;
-
-        // Group radio buttons by name
-        if (el.type === 'radio') {
-            const groupName = el.name || `radio_${index}`;
-            if (!radioGroups[groupName]) {
-                radioGroups[groupName] = {
+        if (descriptor.type === "radio" && descriptor.group_key) {
+            if (!radioGroups.has(descriptor.group_key)) {
+                radioGroups.set(descriptor.group_key, {
+                    first: descriptor,
                     elements: [],
-                    labels: [],
-                    selector: generateUniqueSelector(el),
-                    required: el.required || el.getAttribute("aria-required") === "true",
-                };
+                    options: [],
+                });
             }
-            radioGroups[groupName].elements.push(el);
-            const labelText = el.labels?.[0]?.textContent?.trim() ||
-                el.value ||
-                el.nextSibling?.textContent?.trim() || '';
-            if (labelText) radioGroups[groupName].labels.push(labelText);
-            return;
+
+            const group = radioGroups.get(descriptor.group_key);
+            group.elements.push(el);
+            if (descriptor.option_text) {
+                group.options.push({
+                    value: descriptor.option_value || descriptor.option_text,
+                    text: descriptor.option_text,
+                });
+            }
+            continue;
         }
 
-        const label = findLabelForElement(el);
-        fields.push({
-            index: index,
-            tag: el.tagName.toLowerCase(),
-            type: el.type || (el.tagName === "TEXTAREA" ? "textarea" : "text"),
-            name: el.name || "",
-            id: el.id || "",
-            label: label,
-            placeholder: el.placeholder || "",
-            value: el.value || "",
-            required: el.required || el.getAttribute("aria-required") === "true",
-            options: el.tagName === "SELECT"
-                ? Array.from(el.options).map(o => ({ value: o.value, text: o.text }))
-                : [],
-            boundingBox: el.getBoundingClientRect(),
-            visible: true,
-            selector: generateUniqueSelector(el),
-        });
-    });
+        descriptor.index = outputIndex++;
+        fields.push(stripInternalFieldProps(descriptor));
+    }
 
-    // Add grouped radio buttons as single fields with options
-    for (const [name, group] of Object.entries(radioGroups)) {
-        // Find the question/label for the radio group
-        const firstEl = group.elements[0];
-        let groupLabel = findLabelForElement(firstEl);
-
-        // If no direct label, look for the closest fieldset legend or parent text
-        if (!groupLabel || groupLabel === 'Unknown field') {
-            const fieldset = firstEl.closest('fieldset');
-            if (fieldset) {
-                const legend = fieldset.querySelector('legend');
-                groupLabel = legend?.textContent?.trim() || '';
-            }
-            if (!groupLabel) {
-                // Check parent containers for question text
-                let parent = firstEl.parentElement;
-                for (let i = 0; i < 5 && parent; i++) {
-                    const textNodes = Array.from(parent.childNodes)
-                        .filter(n => n.nodeType === 3 && n.textContent.trim())
-                        .map(n => n.textContent.trim());
-                    if (textNodes.length) {
-                        groupLabel = textNodes[0];
-                        break;
-                    }
-                    const labelEl = parent.querySelector('label, .label, [class*="label"], [class*="question"]');
-                    if (labelEl && !labelEl.querySelector('input')) {
-                        groupLabel = labelEl.textContent.trim();
-                        break;
-                    }
-                    parent = parent.parentElement;
-                }
-            }
-        }
-
-        fields.push({
-            index: fields.length,
-            tag: "input",
-            type: "radio",
-            name: name,
-            id: firstEl.id || "",
-            label: groupLabel || name,
-            placeholder: "",
-            value: group.elements.find(e => e.checked)?.value || "",
-            required: group.required,
-            options: group.labels.map(l => ({ value: l, text: l })),
-            boundingBox: firstEl.getBoundingClientRect(),
-            visible: true,
-            selector: group.selector,
-        });
+    for (const group of radioGroups.values()) {
+        const grouped = buildRadioGroupField(group.first, group.options, outputIndex++);
+        fields.push(stripInternalFieldProps(grouped));
     }
 
     return fields;
 }
 
-function findLabelForElement(el) {
-    // 1. Explicit <label for="...">
-    if (el.id) {
-        const label = document.querySelector(`label[for="${el.id}"]`);
-        if (label && label.textContent.trim()) return label.textContent.trim();
-    }
+function collectFormControls(root) {
+    const controls = [];
+    const seen = new Set();
 
-    // 2. Implicit <label> wrapper
-    const parentLabel = el.closest("label");
-    if (parentLabel && parentLabel.textContent.trim()) {
-        // Make sure we don't accidentally pull in the input's own text if it's weirdly formatted
-        let text = parentLabel.innerText.trim();
-        if (text) return text.split("\n")[0].trim();
-    }
+    for (const searchRoot of collectSearchRoots(root)) {
+        const scope = searchRoot.nodeType === Node.DOCUMENT_NODE
+            ? searchRoot.documentElement
+            : searchRoot;
 
-    // 3. Aria attributes (very common in modern React/Angular/Google Forms)
-    if (el.getAttribute("aria-label")) return el.getAttribute("aria-label");
-    if (el.getAttribute("aria-labelledby")) {
-        const labelledByElement = document.getElementById(el.getAttribute("aria-labelledby"));
-        if (labelledByElement) return labelledByElement.textContent.trim();
-    }
+        if (!scope) continue;
 
-    // 4. Look at parent structures. Google Forms often wrap the question in a div with role="heading" or similar.
-    // We'll walk up a few levels and look for common label-like elements preceeding us.
-    let currentParent = el.parentElement;
-    for (let i = 0; i < 4; i++) { // Check up to 4 levels up
-        if (!currentParent) break;
+        const walker = document.createTreeWalker(scope, NodeFilter.SHOW_ELEMENT);
+        let current = scope;
 
-        // Check for previous siblings of parents that might be headings
-        let prev = currentParent.previousElementSibling;
-        while (prev) {
-            if (['LABEL', 'SPAN', 'DIV', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6'].includes(prev.tagName)) {
-                const text = prev.innerText.trim();
-                if (text && text.length < 150) { // arbitrary length to avoid pulling whole paragraphs
-                    // Often spans contain " * " for required fields. Clean it up.
-                    return text.split("\n").filter(line => line.trim() && line.trim() !== "*")[0].trim();
-                }
+        while (current) {
+            if (isPotentialFormControl(current) && !seen.has(current)) {
+                seen.add(current);
+                controls.push(current);
             }
-            prev = prev.previousElementSibling;
+            current = walker.nextNode();
         }
-        currentParent = currentParent.parentElement;
     }
 
-    return el.placeholder || el.name || el.id || "Unknown field";
+    return controls;
 }
 
-function generateUniqueSelector(el) {
-    if (el.id) return `#${el.id}`;
-    if (el.name) return `${el.tagName.toLowerCase()}[name="${el.name}"]`;
+function collectSearchRoots(root, roots = [], seen = new Set()) {
+    if (!root || seen.has(root)) return roots;
+    seen.add(root);
+    roots.push(root);
 
-    // Generating a hierarchical selector as a fallback
-    let path = [];
-    let currentEl = el;
-    while (currentEl && currentEl.nodeType === Node.ELEMENT_NODE) {
-        let selector = currentEl.nodeName.toLowerCase();
-        if (currentEl.id) {
-            selector += '#' + currentEl.id;
-            path.unshift(selector);
-            break;
-        } else {
-            let sibling = currentEl;
-            let nth = 1;
-            while (sibling = sibling.previousElementSibling) {
-                if (sibling.nodeName.toLowerCase() == selector) nth++;
-            }
-            if (nth != 1) selector += ":nth-of-type(" + nth + ")";
+    const scope = root.nodeType === Node.DOCUMENT_NODE ? root.documentElement : root;
+    if (!scope) return roots;
+
+    const walker = document.createTreeWalker(scope, NodeFilter.SHOW_ELEMENT);
+    let current = scope;
+
+    while (current) {
+        const shadowRoot = getShadowRoot(current);
+        if (shadowRoot) {
+            collectSearchRoots(shadowRoot, roots, seen);
         }
-        path.unshift(selector);
-        currentEl = currentEl.parentNode;
+        current = walker.nextNode();
     }
-    return path.join(" > ");
+
+    return roots;
 }
 
-function isElementVisible(el) {
-    const rect = el.getBoundingClientRect();
-    const style = window.getComputedStyle(el);
-    return (
-        rect.width > 0 &&
-        rect.height > 0 &&
-        style.display !== "none" &&
-        style.visibility !== "hidden"
-    );
-}
+function getShadowRoot(el) {
+    if (!(el instanceof Element)) return null;
+    if (el.shadowRoot) return el.shadowRoot;
 
-// ═══════════════════════════════════════════════════
-// Robust Field Finder — works even without CSS selectors
-// Tracks already-filled elements to prevent double-filling
-// ═══════════════════════════════════════════════════
-
-// Track which DOM elements have been filled in this session
-const _filledElements = new Set();
-
-function findFieldElement(selector, label, name, fieldType) {
-    const allInputs = Array.from(document.querySelectorAll("input, textarea, select"))
-        .filter(el => isElementVisible(el) && !['submit', 'button', 'image', 'reset', 'hidden'].includes(el.type))
-        .filter(el => !_filledElements.has(el));  // Skip already-filled elements
-
-    // Level 0: Special handling for radio buttons
-    // Radio group labels are on the parent container, not on individual radios
-    if (fieldType === 'radio' && label) {
-        const labelLower = label.toLowerCase();
-        // Find all radio inputs
-        const allRadios = allInputs.filter(el => el.type === 'radio');
-        for (const radio of allRadios) {
-            // Walk up to find a container that has the question text
-            let parent = radio.parentElement;
-            for (let i = 0; i < 6 && parent; i++) {
-                const text = (parent.innerText || '').toLowerCase();
-                if (text.includes(labelLower) || labelLower.includes(text.substring(0, 50))) {
-                    return radio; // Return the first radio in the matching group
-                }
-                parent = parent.parentElement;
-            }
+    try {
+        const maybeRoot = chrome?.dom?.openOrClosedShadowRoot?.(el);
+        if (maybeRoot && typeof maybeRoot.then !== "function") {
+            return maybeRoot;
         }
-        // Also try by name attribute
-        if (name) {
-            const radio = allRadios.find(r => r.name && r.name.toLowerCase().includes(name.toLowerCase()));
-            if (radio) return radio;
-        }
-    }
-
-    // Level 1: CSS selector (when DOM extraction worked)
-    if (selector) {
-        try {
-            const el = document.querySelector(selector);
-            if (el && !_filledElements.has(el)) return el;
-        } catch (e) { /* invalid selector */ }
-    }
-
-    // Level 2: Match by associated <label> text
-    if (label) {
-        const labelLower = label.toLowerCase().trim();
-        for (const input of allInputs) {
-            const inputLabel = findLabelForElement(input).toLowerCase().trim();
-            if (inputLabel && (inputLabel.includes(labelLower) || labelLower.includes(inputLabel))) {
-                return input;
-            }
-        }
-    }
-
-    // Level 3: Match by aria-label
-    if (label) {
-        const labelLower = label.toLowerCase();
-        const found = allInputs.find(el => {
-            const aria = (el.getAttribute('aria-label') || '').toLowerCase();
-            return aria && (aria.includes(labelLower) || labelLower.includes(aria));
-        });
-        if (found) return found;
-    }
-
-    // Level 4: Match by name attribute or placeholder
-    if (name || label) {
-        const found = allInputs.find(el => {
-            if (name && el.name && el.name.toLowerCase().includes(name.toLowerCase())) return true;
-            if (label) {
-                const ph = (el.placeholder || '').toLowerCase();
-                if (ph && ph.includes(label.toLowerCase())) return true;
-            }
-            return false;
-        });
-        if (found) return found;
-    }
-
-    // Level 5: Fuzzy search — check text near each input
-    if (label) {
-        const keywords = label.toLowerCase().split(/\s+/).filter(w => w.length > 2);
-        let bestMatch = null;
-        let bestScore = 0;
-
-        for (const input of allInputs) {
-            let parent = input.parentElement;
-            for (let i = 0; i < 4 && parent; i++) {
-                const text = parent.innerText?.toLowerCase() || '';
-                let score = 0;
-                for (const kw of keywords) {
-                    if (text.includes(kw)) score++;
-                }
-                if (score > bestScore && score >= Math.ceil(keywords.length * 0.5)) {
-                    bestScore = score;
-                    bestMatch = input;
-                }
-                parent = parent.parentElement;
-            }
-        }
-        if (bestMatch) return bestMatch;
+    } catch (_) {
+        // Closed shadow roots remain inaccessible unless the extension
+        // is explicitly allowed to inspect them.
     }
 
     return null;
+}
+
+function isPotentialFormControl(el) {
+    if (!(el instanceof Element)) return false;
+
+    const tag = el.tagName.toLowerCase();
+    const role = normalizeToken(el.getAttribute("role"));
+
+    if (tag === "input") {
+        return !EXCLUDED_INPUT_TYPES.has((el.type || "text").toLowerCase());
+    }
+
+    if (tag === "select" || tag === "textarea") {
+        return true;
+    }
+
+    if (isContentEditableField(el)) {
+        return true;
+    }
+
+    if (EXTRACTABLE_ROLES.has(role)) {
+        return true;
+    }
+
+    return tag.includes("-") && (
+        !!el.getAttribute("name") ||
+        !!el.getAttribute("form") ||
+        !!el.getAttribute("role") ||
+        !!el.getAttribute("aria-label") ||
+        !!el.getAttribute("aria-labelledby")
+    );
+}
+
+function isContentEditableField(el) {
+    if (!(el instanceof HTMLElement) || !el.isContentEditable) return false;
+    if (el.getAttribute("contenteditable") === "false") return false;
+
+    const parent = el.parentElement;
+    return !parent || !parent.isContentEditable || el.hasAttribute("contenteditable");
+}
+
+function isElementVisible(el) {
+    if (!(el instanceof Element)) return false;
+    if (el.hidden) return false;
+    if (el.getAttribute("aria-hidden") === "true") return false;
+
+    const style = window.getComputedStyle(el);
+    if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") {
+        return false;
+    }
+
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+}
+
+function buildFieldDescriptor(el, index) {
+    if (!isElementVisible(el)) return null;
+
+    const fieldType = inferFieldType(el);
+    if (!fieldType) return null;
+
+    const labelData = fieldType === "radio"
+        ? findRadioDescriptorLabel(el)
+        : findLabelData(el);
+
+    const formpilotId = ensureFormPilotId(el);
+    const role = normalizeToken(el.getAttribute("role"));
+    const descriptor = {
+        index,
+        tag: el.tagName.toLowerCase(),
+        type: fieldType,
+        role,
+        name: el.getAttribute("name") || "",
+        id: el.id || "",
+        label: labelData.text,
+        label_source: labelData.source,
+        accessible_label: findAccessibleLabel(el) || labelData.text,
+        placeholder: getPlaceholderText(el),
+        value: getControlValue(el),
+        required: isRequiredControl(el),
+        disabled: isDisabledControl(el),
+        readonly: isReadOnlyControl(el),
+        multiple: !!el.multiple || el.getAttribute("aria-multiselectable") === "true",
+        options: extractOptionsForElement(el),
+        autocomplete: getAutocompleteToken(el),
+        input_mode: el.inputMode || el.getAttribute("inputmode") || "",
+        semantic_type: inferSemanticType(el, labelData.text),
+        boundingBox: serializeRect(el.getBoundingClientRect()),
+        visible: true,
+        selector: `[data-formpilot-id="${formpilotId}"]`,
+        formpilot_id: formpilotId,
+        form_id: el.form?.id || el.getAttribute("form") || "",
+    };
+
+    if (fieldType === "radio") {
+        descriptor.group_key = getRadioGroupKey(el);
+        descriptor.option_text = getRadioOptionLabel(el);
+        descriptor.option_value = el.value || descriptor.option_text || "";
+    }
+
+    return descriptor;
+}
+
+function stripInternalFieldProps(field) {
+    const clean = { ...field };
+    delete clean.group_key;
+    delete clean.option_text;
+    delete clean.option_value;
+    return clean;
+}
+
+function buildRadioGroupField(first, options, index) {
+    const dedupedOptions = dedupeOptions(options);
+    return {
+        ...first,
+        index,
+        value: getRadioGroupValue(first.selector, first.name),
+        options: dedupedOptions,
+    };
+}
+
+function getRadioGroupValue(selector, name) {
+    const radio = findFieldElement(selector, "", name, "radio");
+    if (!radio || !radio.name) return radio?.value || "";
+    const checked = Array.from(getAllFillableControls()).find(
+        (el) => el.type === "radio" && el.name === radio.name && el.checked
+    );
+    return checked?.value || "";
+}
+
+function dedupeOptions(options) {
+    const seen = new Set();
+    const result = [];
+
+    for (const option of options) {
+        const text = normalizeText(option?.text || "");
+        const value = normalizeText(option?.value || text);
+        const key = `${value}::${text}`;
+        if (!text || seen.has(key)) continue;
+        seen.add(key);
+        result.push({ value, text });
+    }
+
+    return result;
+}
+
+function inferFieldType(el) {
+    const tag = el.tagName.toLowerCase();
+    const role = normalizeToken(el.getAttribute("role"));
+
+    if (tag === "select") return el.multiple ? "multiselect" : "select";
+    if (tag === "textarea") return "textarea";
+    if (isContentEditableField(el)) return "textarea";
+
+    if (tag === "input") {
+        const nativeType = (el.type || "text").toLowerCase();
+        if (EXCLUDED_INPUT_TYPES.has(nativeType)) return null;
+        return nativeType || "text";
+    }
+
+    if (role === "textbox" || role === "searchbox") {
+        return el.getAttribute("aria-multiline") === "true" ? "textarea" : "text";
+    }
+    if (role === "combobox") return "combobox";
+    if (role === "listbox") return "select";
+    if (role === "checkbox" || role === "switch") return "checkbox";
+    if (role === "radio") return "radio";
+    if (role === "spinbutton") return "number";
+
+    if (tag.includes("-")) {
+        if (el.getAttribute("aria-haspopup") === "listbox") return "combobox";
+        if (el.hasAttribute("contenteditable")) return "textarea";
+        return "text";
+    }
+
+    return null;
+}
+
+function inferSemanticType(el, label) {
+    const autocomplete = getAutocompleteToken(el);
+    if (autocomplete) return autocomplete;
+
+    const fieldType = inferFieldType(el);
+    if (fieldType && fieldType !== "text") return fieldType;
+
+    const inputMode = normalizeToken(el.inputMode || el.getAttribute("inputmode"));
+    if (inputMode) return inputMode;
+
+    const haystack = [
+        label,
+        el.getAttribute("name"),
+        el.id,
+        getPlaceholderText(el),
+    ].map((value) => normalizeText(value).toLowerCase()).join(" ");
+
+    if (haystack.includes("email")) return "email";
+    if (haystack.includes("phone") || haystack.includes("mobile") || haystack.includes("telephone")) return "tel";
+    if (haystack.includes("country")) return "country";
+    if (haystack.includes("city")) return "city";
+    if (haystack.includes("state") || haystack.includes("province")) return "state";
+    if (haystack.includes("address")) return "street-address";
+    if (haystack.includes("zip") || haystack.includes("postal")) return "postal-code";
+    if (haystack.includes("first name")) return "given-name";
+    if (haystack.includes("last name")) return "family-name";
+    if (haystack.includes("full name")) return "name";
+    if (haystack.includes("company") || haystack.includes("organization")) return "organization";
+    if (haystack.includes("url") || haystack.includes("website")) return "url";
+    if (haystack.includes("date")) return "date";
+
+    return "text";
+}
+
+function getAutocompleteToken(el) {
+    const raw = normalizeText(el.getAttribute("autocomplete") || "");
+    if (!raw) return "";
+
+    const tokens = raw.split(/\s+/).filter(Boolean);
+    return tokens[tokens.length - 1] || "";
+}
+
+function getPlaceholderText(el) {
+    return normalizeText(
+        el.getAttribute("placeholder") ||
+        el.getAttribute("data-placeholder") ||
+        ""
+    );
+}
+
+function getControlValue(el) {
+    const role = normalizeToken(el.getAttribute("role"));
+
+    if (el.tagName === "SELECT") {
+        const selected = Array.from(el.selectedOptions || []);
+        return selected.map((option) => option.text || option.value).join(", ");
+    }
+
+    if (el.type === "checkbox" || role === "checkbox" || role === "switch") {
+        return isCheckedControl(el) ? (el.value || "true") : "";
+    }
+
+    if (el.type === "radio" || role === "radio") {
+        return isCheckedControl(el) ? (el.value || getRadioOptionLabel(el)) : "";
+    }
+
+    if ("value" in el && typeof el.value === "string") {
+        return el.value;
+    }
+
+    if (isContentEditableField(el)) {
+        return normalizeText(el.innerText || el.textContent || "");
+    }
+
+    if (role === "combobox" || role === "listbox" || role === "textbox") {
+        return normalizeText(el.innerText || el.textContent || "");
+    }
+
+    return "";
+}
+
+function extractOptionsForElement(el) {
+    if (el.tagName === "SELECT") {
+        return Array.from(el.options || []).map((option) => ({
+            value: option.value,
+            text: normalizeText(option.text || option.label || option.value),
+        }));
+    }
+
+    if (el.type === "radio") {
+        return [];
+    }
+
+    if (el.tagName === "INPUT" && el.list) {
+        return Array.from(el.list.options || []).map((option) => ({
+            value: option.value,
+            text: normalizeText(option.label || option.value),
+        }));
+    }
+
+    const role = normalizeToken(el.getAttribute("role"));
+    if (role === "combobox" || role === "listbox") {
+        return extractAriaOptions(el);
+    }
+
+    return [];
+}
+
+function extractAriaOptions(el) {
+    const roots = [];
+    const controlsId = normalizeText(el.getAttribute("aria-controls"));
+    const ownsId = normalizeText(el.getAttribute("aria-owns"));
+
+    if (controlsId) roots.push(findElementById(el, controlsId));
+    if (ownsId) roots.push(findElementById(el, ownsId));
+    roots.push(el);
+
+    const options = [];
+    for (const root of roots.filter(Boolean)) {
+        for (const option of root.querySelectorAll('[role="option"]')) {
+            options.push({
+                value: normalizeText(option.getAttribute("data-value") || option.getAttribute("value") || option.innerText || option.textContent || ""),
+                text: normalizeText(option.innerText || option.textContent || option.getAttribute("aria-label") || ""),
+            });
+        }
+    }
+
+    return dedupeOptions(options);
+}
+
+function findLabelData(el) {
+    const candidates = [
+        getLabelsApiText(el, "labels-api"),
+        getExplicitLabelText(el, "label-for"),
+        getWrapperLabelText(el, "label-wrapper"),
+        getFieldsetLegendText(el, "fieldset-legend"),
+        getAriaLabelledByText(el, "aria-labelledby"),
+        getAriaLabelText(el, "aria-label"),
+        getNearbyQuestionText(el, "nearby-question"),
+    ];
+
+    for (const candidate of candidates) {
+        if (candidate.text) return candidate;
+    }
+
+    const placeholder = getPlaceholderText(el);
+    if (placeholder) return { text: placeholder, source: "placeholder" };
+    if (el.getAttribute("name")) return { text: el.getAttribute("name"), source: "name" };
+    if (el.id) return { text: el.id, source: "id" };
+
+    return { text: "Unknown field", source: "unknown" };
+}
+
+function findRadioDescriptorLabel(el) {
+    const candidates = [
+        getGroupContainerLabel(el, "group-container"),
+        getFieldsetLegendText(el, "fieldset-legend"),
+        getAriaLabelledByText(el, "aria-labelledby"),
+        getAriaLabelText(el, "aria-label"),
+        getNearbyQuestionText(el, "nearby-question"),
+    ];
+
+    for (const candidate of candidates) {
+        if (candidate.text) return candidate;
+    }
+
+    return findLabelData(el);
+}
+
+function getLabelsApiText(el, source) {
+    try {
+        const texts = Array.from(el.labels || [])
+            .map((label) => normalizeText(label.innerText || label.textContent || ""))
+            .filter(Boolean);
+        if (texts.length) {
+            return { text: texts.join(" "), source };
+        }
+    } catch (_) { }
+    return { text: "", source };
+}
+
+function getExplicitLabelText(el, source) {
+    if (!el.id) return { text: "", source };
+
+    const selector = `label[for="${cssEscape(el.id)}"]`;
+    for (const root of getQueryRootsForElement(el)) {
+        try {
+            const label = root.querySelector(selector);
+            if (label) {
+                const text = normalizeText(label.innerText || label.textContent || "");
+                if (text) return { text, source };
+            }
+        } catch (_) { }
+    }
+
+    return { text: "", source };
+}
+
+function getWrapperLabelText(el, source) {
+    const label = el.closest("label");
+    if (!label) return { text: "", source };
+
+    const text = normalizeText(label.innerText || label.textContent || "");
+    return text ? { text, source } : { text: "", source };
+}
+
+function getFieldsetLegendText(el, source) {
+    const fieldset = el.closest("fieldset");
+    if (!fieldset) return { text: "", source };
+
+    const legend = fieldset.querySelector("legend");
+    const text = normalizeText(legend?.innerText || legend?.textContent || "");
+    return text ? { text, source } : { text: "", source };
+}
+
+function getAriaLabelText(el, source) {
+    const text = normalizeText(el.getAttribute("aria-label") || "");
+    return text ? { text, source } : { text: "", source };
+}
+
+function getAriaLabelledByText(el, source) {
+    const raw = normalizeText(el.getAttribute("aria-labelledby") || "");
+    if (!raw) return { text: "", source };
+
+    const text = raw
+        .split(/\s+/)
+        .map((id) => findElementById(el, id))
+        .filter(Boolean)
+        .map((node) => normalizeText(node.innerText || node.textContent || ""))
+        .filter(Boolean)
+        .join(" ");
+
+    return text ? { text, source } : { text: "", source };
+}
+
+function getGroupContainerLabel(el, source) {
+    const container = el.closest('[role="radiogroup"], [role="group"], fieldset');
+    if (!container) return { text: "", source };
+
+    const labelled = getAriaLabelledByText(container, source);
+    if (labelled.text) return labelled;
+
+    const direct = getAriaLabelText(container, source);
+    if (direct.text) return direct;
+
+    const legend = container.querySelector("legend");
+    const legendText = normalizeText(legend?.innerText || legend?.textContent || "");
+    if (legendText) return { text: legendText, source };
+
+    const heading = container.querySelector("label, legend, [role='heading'], h1, h2, h3, h4, h5, h6, .label, .question");
+    const headingText = normalizeText(heading?.innerText || heading?.textContent || "");
+    return headingText ? { text: headingText, source } : { text: "", source };
+}
+
+function getNearbyQuestionText(el, source) {
+    let current = el;
+    for (let depth = 0; depth < 5 && current; depth += 1) {
+        let sibling = current.previousElementSibling;
+        while (sibling) {
+            const text = extractQuestionLikeText(sibling);
+            if (text) return { text, source };
+            sibling = sibling.previousElementSibling;
+        }
+
+        const parent = current.parentElement;
+        if (!parent) break;
+
+        const childText = Array.from(parent.children)
+            .filter((child) => child !== current && !child.contains(current))
+            .map((child) => extractQuestionLikeText(child))
+            .find(Boolean);
+        if (childText) return { text: childText, source };
+
+        current = parent;
+    }
+
+    return { text: "", source };
+}
+
+function extractQuestionLikeText(el) {
+    if (!(el instanceof Element)) return "";
+    if (el.matches("input, select, textarea, [role='option'], [role='radio'], [role='checkbox']")) {
+        return "";
+    }
+
+    const text = normalizeText(el.innerText || el.textContent || "");
+    if (!text || text.length > 160) return "";
+    return text;
+}
+
+function findAccessibleLabel(el) {
+    return (
+        getAriaLabelledByText(el, "aria-labelledby").text ||
+        getAriaLabelText(el, "aria-label").text ||
+        getLabelsApiText(el, "labels-api").text
+    );
+}
+
+function getChoiceLabel(el) {
+    const candidates = [
+        getLabelsApiText(el, "labels-api").text,
+        getExplicitLabelText(el, "label-for").text,
+        getWrapperLabelText(el, "label-wrapper").text,
+        getAriaLabelledByText(el, "aria-labelledby").text,
+        getAriaLabelText(el, "aria-label").text,
+        getAdjacentOptionText(el),
+        normalizeText(el.value || ""),
+    ];
+
+    return candidates.find(Boolean) || "";
+}
+
+function getRadioOptionLabel(el) {
+    const groupLabel = findRadioDescriptorLabel(el).text;
+    const candidates = [
+        getLabelsApiText(el, "labels-api").text,
+        getExplicitLabelText(el, "label-for").text,
+        getWrapperLabelText(el, "label-wrapper").text,
+        getAriaLabelledByText(el, "aria-labelledby").text,
+        getAriaLabelText(el, "aria-label").text,
+        getAdjacentOptionText(el),
+        normalizeText(el.value || ""),
+    ]
+        .map((candidate) => sanitizeOptionLabel(candidate, groupLabel))
+        .filter(Boolean);
+
+    return candidates.find(Boolean) || normalizeText(el.value || "");
+}
+
+function getAdjacentOptionText(el) {
+    const siblings = [
+        el.nextElementSibling,
+        el.previousElementSibling,
+    ].filter(Boolean);
+
+    for (const sibling of siblings) {
+        const text = normalizeText(sibling.innerText || sibling.textContent || "");
+        if (text && text.length <= 60) return text;
+    }
+
+    const nodeSiblings = [
+        el.nextSibling,
+        el.previousSibling,
+    ].filter((node) => node && node.nodeType === Node.TEXT_NODE);
+
+    for (const node of nodeSiblings) {
+        const text = normalizeText(node.textContent || "");
+        if (text && text.length <= 60) return text;
+    }
+
+    return "";
+}
+
+function sanitizeOptionLabel(text, groupLabel) {
+    let normalized = normalizeText(text);
+    if (!normalized) return "";
+
+    const normalizedGroup = normalizeText(groupLabel);
+    if (normalizedGroup && normalized === normalizedGroup) {
+        return "";
+    }
+
+    if (normalizedGroup && normalized.startsWith(normalizedGroup)) {
+        normalized = normalizeText(normalized.slice(normalizedGroup.length));
+    }
+
+    if (!normalized) return "";
+    if (normalized.length > 80) return "";
+    return normalized;
+}
+
+function getRadioGroupKey(el) {
+    const groupContainer = el.closest('[role="radiogroup"], fieldset');
+    if (groupContainer) {
+        return `radio:${ensureFormPilotId(groupContainer)}`;
+    }
+
+    if (el.name) return `radio-name:${el.name}`;
+    return `radio:${ensureFormPilotId(el)}`;
+}
+
+function ensureFormPilotId(el) {
+    if (!(el instanceof HTMLElement)) return "";
+    if (!el.dataset.formpilotId) {
+        _formPilotElementCounter += 1;
+        el.dataset.formpilotId = `fp-${_formPilotElementCounter}`;
+    }
+    return el.dataset.formpilotId;
+}
+
+function serializeRect(rect) {
+    return {
+        x: rect.x,
+        y: rect.y,
+        width: rect.width,
+        height: rect.height,
+        top: rect.top,
+        right: rect.right,
+        bottom: rect.bottom,
+        left: rect.left,
+    };
+}
+
+function isRequiredControl(el) {
+    return !!el.required ||
+        el.getAttribute("aria-required") === "true" ||
+        el.hasAttribute("required");
+}
+
+function isDisabledControl(el) {
+    return !!el.disabled || el.getAttribute("aria-disabled") === "true";
+}
+
+function isReadOnlyControl(el) {
+    return !!el.readOnly || el.getAttribute("aria-readonly") === "true";
+}
+
+function getQueryRootsForElement(el) {
+    const roots = [];
+    const rootNode = el.getRootNode?.();
+    if (rootNode && rootNode.querySelector) roots.push(rootNode);
+    if (el.ownerDocument && !roots.includes(el.ownerDocument)) roots.push(el.ownerDocument);
+    return roots;
+}
+
+function findElementById(el, id) {
+    if (!id) return null;
+
+    const escaped = cssEscape(id);
+    for (const root of getQueryRootsForElement(el)) {
+        try {
+            const node = root.querySelector(`#${escaped}`);
+            if (node) return node;
+        } catch (_) { }
+    }
+
+    return null;
+}
+
+function cssEscape(value) {
+    if (window.CSS?.escape) return window.CSS.escape(value);
+    return String(value).replace(/["\\#.:()[\]\s]/g, "\\$&");
+}
+
+function normalizeText(text) {
+    return String(text || "")
+        .replace(/\s+/g, " ")
+        .replace(/\s*\*\s*$/, "")
+        .trim();
+}
+
+function normalizeToken(value) {
+    return normalizeText(value).toLowerCase();
+}
+
+function getAllFillableControls() {
+    return collectFormControls(document)
+        .filter((el) => isElementVisible(el))
+        .filter((el) => !_filledElements.has(el));
+}
+
+function findFieldElement(selector, label, name, fieldType) {
+    const allInputs = getAllFillableControls();
+
+    const byStableId = findByStableSelector(allInputs, selector);
+    if (byStableId) return byStableId;
+
+    if (fieldType === "radio" && label) {
+        const match = findRadioLikeElement(allInputs, label, name);
+        if (match) return match;
+    }
+
+    if (selector) {
+        const match = querySelectorAcrossRoots(selector);
+        if (match && !_filledElements.has(match)) return match;
+    }
+
+    if (label) {
+        const labelLower = label.toLowerCase().trim();
+        const byLabel = allInputs.find((input) => {
+            const inputLabel = findLabelData(input).text.toLowerCase().trim();
+            const accessible = findAccessibleLabel(input).toLowerCase().trim();
+            return [inputLabel, accessible].some((candidate) =>
+                candidate && (candidate.includes(labelLower) || labelLower.includes(candidate))
+            );
+        });
+        if (byLabel) return byLabel;
+    }
+
+    if (name || label) {
+        const nameLower = normalizeToken(name);
+        const labelLower = normalizeToken(label);
+        const byMetadata = allInputs.find((input) => {
+            const metadata = [
+                input.getAttribute("name"),
+                input.id,
+                getPlaceholderText(input),
+                input.getAttribute("autocomplete"),
+                input.getAttribute("aria-label"),
+            ].map((value) => normalizeToken(value));
+
+            return metadata.some((candidate) =>
+                candidate && (
+                    (nameLower && candidate.includes(nameLower)) ||
+                    (labelLower && candidate.includes(labelLower))
+                )
+            );
+        });
+        if (byMetadata) return byMetadata;
+    }
+
+    if (label) {
+        return fuzzyMatchByNearbyText(allInputs, label);
+    }
+
+    return null;
+}
+
+function findByStableSelector(allInputs, selector) {
+    const match = /\[data-formpilot-id="([^"]+)"\]/.exec(selector || "");
+    if (!match) return null;
+    const expectedId = match[1];
+    return allInputs.find((el) => el.dataset?.formpilotId === expectedId) || null;
+}
+
+function querySelectorAcrossRoots(selector) {
+    for (const root of collectSearchRoots(document)) {
+        if (!root.querySelector) continue;
+        try {
+            const el = root.querySelector(selector);
+            if (el) return el;
+        } catch (_) { }
+    }
+    return null;
+}
+
+function findRadioLikeElement(allInputs, label, name) {
+    const labelLower = label.toLowerCase();
+    const radios = allInputs.filter((el) => inferFieldType(el) === "radio");
+
+    for (const radio of radios) {
+        const container = radio.closest('[role="radiogroup"], [role="group"], fieldset') || radio.parentElement;
+        const text = normalizeToken(container?.innerText || "");
+        if (text && (text.includes(labelLower) || labelLower.includes(text.slice(0, 80)))) {
+            return radio;
+        }
+    }
+
+    if (name) {
+        const byName = radios.find((radio) => normalizeToken(radio.getAttribute("name")).includes(normalizeToken(name)));
+        if (byName) return byName;
+    }
+
+    return null;
+}
+
+function fuzzyMatchByNearbyText(allInputs, label) {
+    const keywords = label.toLowerCase().split(/\s+/).filter((word) => word.length > 2);
+    let bestMatch = null;
+    let bestScore = 0;
+
+    for (const input of allInputs) {
+        let parent = input.parentElement;
+        for (let depth = 0; depth < 4 && parent; depth += 1) {
+            const text = normalizeToken(parent.innerText || "");
+            const score = keywords.reduce((sum, keyword) => sum + (text.includes(keyword) ? 1 : 0), 0);
+            if (score > bestScore && score >= Math.ceil(keywords.length * 0.5)) {
+                bestScore = score;
+                bestMatch = input;
+            }
+            parent = parent.parentElement;
+        }
+    }
+
+    return bestMatch;
 }
 
 function markElementAsFilled(el) {
     if (el) _filledElements.add(el);
 }
 
-// Reset tracking when a new analysis starts
 function resetFilledTracking() {
     _filledElements.clear();
 }
 
-// ═══════════════════════════════════════════════════
-// Robust Element Filler — works across React/Angular/vanilla
-// ═══════════════════════════════════════════════════
-
 function fillElement(el, value) {
+    const desired = String(value ?? "");
+    const type = inferFieldType(el);
+    const role = normalizeToken(el.getAttribute("role"));
+
     el.focus();
 
-    // Handle radio buttons — find the right radio in the group
-    if (el.type === 'radio') {
-        const radios = el.name
-            ? document.querySelectorAll(`input[type="radio"][name="${el.name}"]`)
-            : [el];
-        for (const radio of radios) {
-            const radioLabel = radio.labels?.[0]?.textContent?.trim() ||
-                radio.value ||
-                radio.nextSibling?.textContent?.trim() || '';
-            if (radioLabel.toLowerCase().includes(value.toLowerCase()) ||
-                value.toLowerCase().includes(radioLabel.toLowerCase())) {
-                radio.click();
-                radio.checked = true;
-                radio.dispatchEvent(new Event("change", { bubbles: true }));
-                // Visual feedback
-                const parent = radio.closest('label') || radio.parentElement;
-                if (parent) {
-                    parent.style.outline = "2px solid #a6e3a1";
-                    setTimeout(() => { parent.style.outline = ""; }, 800);
-                }
-                return;
-            }
-        }
-        // If no match found, just click the first one
-        el.click();
+    if (type === "radio") {
+        fillRadioGroup(el, desired);
+        return;
+    }
+
+    if (type === "checkbox" || role === "switch") {
+        fillBooleanControl(el, desired);
+        return;
+    }
+
+    if (el.tagName === "SELECT") {
+        fillNativeSelect(el, desired);
+        return;
+    }
+
+    if (type === "combobox" || type === "select") {
+        if (fillCompositeChoice(el, desired)) return;
+    }
+
+    if (isContentEditableField(el) || (role === "textbox" && !("value" in el))) {
+        fillEditableRegion(el, desired);
         return;
     }
 
     el.click();
 
-    // Handle select dropdowns
-    if (el.tagName === 'SELECT') {
-        const option = Array.from(el.options).find(o =>
-            o.text.toLowerCase().includes(value.toLowerCase()) ||
-            o.value.toLowerCase().includes(value.toLowerCase())
-        );
-        if (option) {
-            el.value = option.value;
-        } else {
-            el.value = value;
+    if ("value" in el) {
+        el.value = "";
+        document.execCommand("insertText", false, desired);
+        if (el.value !== desired) {
+            el.value = desired;
         }
-        el.dispatchEvent(new Event("change", { bubbles: true }));
-        return;
+    } else {
+        el.textContent = desired;
     }
 
-    // Clear existing value
-    el.value = "";
+    dispatchValueEvents(el);
+    flashFilledElement(el);
+}
 
-    // Use execCommand for React/Angular compatibility
-    document.execCommand("insertText", false, value);
+function fillRadioGroup(el, value) {
+    const radios = el.name
+        ? getAllFillableControls().filter((candidate) => candidate.type === "radio" && candidate.name === el.name)
+        : [el];
 
-    // Standard DOM event dispatches
+    const desired = value.toLowerCase();
+    for (const radio of radios) {
+        const label = getRadioOptionLabel(radio).toLowerCase();
+        const radioValue = normalizeToken(radio.value);
+        if (matchesChoiceValue(label, radioValue, desired)) {
+            radio.click();
+            radio.checked = true;
+            dispatchValueEvents(radio);
+            flashFilledElement(radio.closest("label") || radio.parentElement || radio);
+            return;
+        }
+    }
+
+    el.click();
+    dispatchValueEvents(el);
+}
+
+function fillBooleanControl(el, value) {
+    const normalized = normalizeToken(value);
+    const wantsChecked = TRUTHY_VALUES.has(normalized) || (!FALSY_VALUES.has(normalized) && normalized !== "");
+    const checked = isCheckedControl(el);
+
+    if (checked !== wantsChecked) {
+        el.click();
+        if ("checked" in el) el.checked = wantsChecked;
+        if (el.getAttribute("role")) {
+            el.setAttribute("aria-checked", String(wantsChecked));
+        }
+    }
+
+    dispatchValueEvents(el);
+    flashFilledElement(el);
+}
+
+function matchesChoiceValue(label, rawValue, desired) {
+    const normalizedDesired = normalizeToken(desired);
+    const normalizedLabel = normalizeToken(label);
+    const normalizedValue = normalizeToken(rawValue);
+
+    if (!normalizedDesired) return false;
+
+    const desiredBoolean = canonicalBoolean(normalizedDesired);
+    if (desiredBoolean !== null) {
+        return [normalizedLabel, normalizedValue].some((candidate) => canonicalBoolean(candidate) === desiredBoolean);
+    }
+
+    return [normalizedLabel, normalizedValue].some((candidate) =>
+        candidate && (
+            candidate === normalizedDesired ||
+            candidate.includes(normalizedDesired) ||
+            normalizedDesired.includes(candidate)
+        )
+    );
+}
+
+function canonicalBoolean(value) {
+    for (const [canonical, aliases] of BOOLEAN_ALIASES.entries()) {
+        if (aliases.includes(value)) return canonical;
+    }
+    return null;
+}
+
+function isCheckedControl(el) {
+    if ("checked" in el) return !!el.checked;
+    return el.getAttribute("aria-checked") === "true";
+}
+
+function fillNativeSelect(el, value) {
+    const option = Array.from(el.options || []).find((candidate) => {
+        const text = normalizeToken(candidate.text);
+        const rawValue = normalizeToken(candidate.value);
+        const desired = normalizeToken(value);
+        return text.includes(desired) || desired.includes(text) || rawValue === desired;
+    });
+
+    el.value = option ? option.value : value;
+    dispatchValueEvents(el);
+    flashFilledElement(el);
+}
+
+function fillCompositeChoice(el, value) {
+    el.click();
+
+    const option = findCompositeOption(el, value);
+    if (!option) return false;
+
+    option.click();
+    dispatchValueEvents(el);
+    flashFilledElement(el);
+    return true;
+}
+
+function findCompositeOption(el, value) {
+    const desired = normalizeToken(value);
+    const roots = [];
+    const controls = normalizeText(el.getAttribute("aria-controls"));
+    const owns = normalizeText(el.getAttribute("aria-owns"));
+
+    if (controls) roots.push(findElementById(el, controls));
+    if (owns) roots.push(findElementById(el, owns));
+    roots.push(document);
+
+    for (const root of roots.filter(Boolean)) {
+        const options = root.querySelectorAll
+            ? root.querySelectorAll('[role="option"], option')
+            : [];
+        for (const option of options) {
+            const text = normalizeToken(option.innerText || option.textContent || option.label || option.value);
+            if (text && (text.includes(desired) || desired.includes(text))) {
+                return option;
+            }
+        }
+    }
+
+    return null;
+}
+
+function fillEditableRegion(el, value) {
+    el.click();
+    if (document.activeElement !== el) el.focus();
+
+    if (document.execCommand) {
+        document.execCommand("selectAll", false, null);
+        document.execCommand("insertText", false, value);
+    }
+
+    const currentText = normalizeText(el.innerText || el.textContent || "");
+    if (currentText !== value) {
+        el.textContent = value;
+    }
+
+    dispatchValueEvents(el);
+    flashFilledElement(el);
+}
+
+function dispatchValueEvents(el) {
     el.dispatchEvent(new Event("input", { bubbles: true }));
     el.dispatchEvent(new Event("change", { bubbles: true }));
     el.dispatchEvent(new Event("blur", { bubbles: true }));
+}
 
-    // Visual green flash feedback
-    const oldBorder = el.style.border;
-    const oldOutline = el.style.outline;
-    el.style.border = "2px solid #a6e3a1";
-    el.style.outline = "2px solid rgba(166, 227, 161, 0.3)";
+function flashFilledElement(el) {
+    const target = el instanceof HTMLElement ? el : null;
+    if (!target) return;
+
+    const oldBorder = target.style.border;
+    const oldOutline = target.style.outline;
+    target.style.border = "2px solid #a6e3a1";
+    target.style.outline = "2px solid rgba(166, 227, 161, 0.3)";
     setTimeout(() => {
-        el.style.border = oldBorder;
-        el.style.outline = oldOutline;
+        target.style.border = oldBorder;
+        target.style.outline = oldOutline;
     }, 800);
 }
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg.type === "EXTRACT_FIELDS") {
-        resetFilledTracking();  // New analysis = reset fill tracking
+        resetFilledTracking();
         sendResponse({ fields: extractFormFields() });
     }
+
     if (msg.type === "FILL_FIELD") {
-        // 5-level element finder with filled-element tracking
         const el = findFieldElement(msg.selector, msg.label, msg.name, msg.fieldType);
 
         if (el) {
             fillElement(el, msg.value);
-            markElementAsFilled(el);  // Track this element as filled
+            markElementAsFilled(el);
             sendResponse({ success: true });
         } else {
             console.warn("[FormPilot] Could not find element for:", msg.label, msg.selector);
             sendResponse({ success: false, error: "Element not found: " + (msg.label || msg.selector) });
         }
     }
+
     if (msg.type === "CLICK_ELEMENT") {
-        const el = document.querySelector(msg.selector);
+        const el = querySelectorAcrossRoots(msg.selector);
         if (el) {
             el.click();
             sendResponse({ success: true });
@@ -403,14 +1130,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             sendResponse({ success: false });
         }
     }
+
     if (msg.type === "SCROLL_PAGE") {
         window.scrollBy(0, msg.amount || 300);
         sendResponse({ success: true });
         return true;
     }
-
-    // Audio recording is now handled by the offscreen document (offscreen/offscreen.js)
-    // No mic code needed in the content script anymore.
 
     return true;
 });

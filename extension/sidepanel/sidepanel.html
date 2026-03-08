@@ -13,7 +13,6 @@
 
     <div class="controls">
       <button id="analyze-btn" class="btn primary">⚡ Analyze & Fill This Form</button>
-      <button id="mic-btn" class="btn mic-btn">🎤 Start Listening</button>
     </div>
 
     <!-- User's speech (what they said) -->
@@ -32,10 +31,17 @@
     </div>
 
     <div class="section">
+      <h3>🎤 Heard You</h3>
+      <div id="heard-log" class="heard-log">
+        <div class="heard-entry muted">Your speech-to-text transcript will appear here.</div>
+      </div>
+    </div>
+
+    <div class="section">
       <h3>📜 Activity Log</h3>
       <div id="activity-log" class="activity-log">
         <div class="log-entry">
-          <span class="log-time">--:--:--</span> FormPilot ready. Open a form and click Analyze.
+          <span class="log-time">--:--:--</span> FormPilot ready. Open a form and click Analyze. Voice will start automatically if anything is still missing.
         </div>
       </div>
     </div>

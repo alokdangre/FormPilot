@@ -100,13 +100,31 @@ function connectLiveWS() {
                                         status: "Fill failed",
                                         message: `⚠️ Failed to fill: ${eventData.label}`
                                     });
+                                    broadcast({
+                                        type: "VOICE_FIELD_FILL_FAILED",
+                                        label: eventData.label,
+                                        value: eventData.value,
+                                        error: chrome.runtime.lastError.message,
+                                    });
                                 } else {
                                     broadcast({
                                         type: "BACKEND_UPDATE",
                                         status: "Filled",
                                         message: `✅ Voice filled: ${eventData.label}`
                                     });
+                                    broadcast({
+                                        type: "VOICE_FIELD_FILLED",
+                                        label: eventData.label,
+                                        value: eventData.value,
+                                    });
                                 }
+                            });
+                        } else {
+                            broadcast({
+                                type: "VOICE_FIELD_FILL_FAILED",
+                                label: eventData.label,
+                                value: eventData.value,
+                                error: "No active tab found",
                             });
                         }
                     });
@@ -203,20 +221,6 @@ function handleADKEvent(event) {
 
 function handleToolCall(toolCall) {
     console.log("[SW] Tool call:", toolCall.name, toolCall.args);
-
-    if (toolCall.name === "fill_field_tool") {
-        // Forward as fill command to the active tab
-        chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-            if (tabs[0]) {
-                chrome.tabs.sendMessage(tabs[0].id, {
-                    type: "FILL_FIELD",
-                    selector: toolCall.args?.selector,
-                    value: toolCall.args?.value,
-                    label: toolCall.args?.field_label,
-                });
-            }
-        });
-    }
 }
 
 function sendToLiveWS(data) {
