@@ -40,9 +40,9 @@ async function startStreaming() {
     audioContext = new AudioContext({ sampleRate: 16000 });
     const source = audioContext.createMediaStreamSource(mediaStream);
 
-    // Use ScriptProcessor to get raw PCM samples
-    // (AudioWorklet would be better but ScriptProcessor works and is simpler)
-    const processor = audioContext.createScriptProcessor(4096, 1, 1);
+    // Smaller chunks reduce speech-to-model latency.
+    // Official Live API starters typically stream 1024-sample frames.
+    const processor = audioContext.createScriptProcessor(1024, 1, 1);
 
     processor.onaudioprocess = (e) => {
         if (!isStreaming) return;

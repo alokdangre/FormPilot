@@ -23,6 +23,31 @@ const BOOLEAN_ALIASES = new Map([
     ["true", ["true", "yes", "y", "1", "on", "checked"]],
     ["false", ["false", "no", "n", "0", "off", "unchecked"]],
 ]);
+const BOOLEAN_TRUE_PHRASES = [
+    "i do",
+    "yes i do",
+    "i have",
+    "already have",
+    "i already have",
+    "yep",
+    "yeah",
+    "sure",
+    "affirmative",
+];
+const BOOLEAN_FALSE_PHRASES = [
+    "i don't",
+    "i dont",
+    "do not",
+    "don't",
+    "dont",
+    "i do not",
+    "i do n't",
+    "nope",
+    "nah",
+    "not really",
+    "have not",
+    "haven't",
+];
 
 // Track which DOM elements have been filled in this session.
 const _filledElements = new Set();
@@ -255,11 +280,10 @@ function buildRadioGroupField(first, options, index) {
 
 function getRadioGroupValue(selector, name) {
     const radio = findFieldElement(selector, "", name, "radio");
-    if (!radio || !radio.name) return radio?.value || "";
-    const checked = Array.from(getAllFillableControls()).find(
-        (el) => el.type === "radio" && el.name === radio.name && el.checked
-    );
-    return checked?.value || "";
+    if (!radio) return "";
+    const checked = getRadioGroupControls(radio).find((candidate) => isCheckedControl(candidate));
+    if (!checked) return "";
+    return getRadioOptionLabel(checked) || checked.value || "";
 }
 
 function dedupeOptions(options) {
@@ -373,7 +397,7 @@ function getControlValue(el) {
     }
 
     if (el.type === "radio" || role === "radio") {
-        return isCheckedControl(el) ? (el.value || getRadioOptionLabel(el)) : "";
+        return isCheckedControl(el) ? (getRadioOptionLabel(el) || el.value) : "";
     }
 
     if ("value" in el && typeof el.value === "string") {
@@ -765,14 +789,18 @@ function normalizeToken(value) {
     return normalizeText(value).toLowerCase();
 }
 
-function getAllFillableControls() {
+function getVisibleControls(includeFilled = true) {
     return collectFormControls(document)
         .filter((el) => isElementVisible(el))
-        .filter((el) => !_filledElements.has(el));
+        .filter((el) => includeFilled || !_filledElements.has(el));
+}
+
+function getAllFillableControls() {
+    return getVisibleControls(false);
 }
 
 function findFieldElement(selector, label, name, fieldType) {
-    const allInputs = getAllFillableControls();
+    const allInputs = getVisibleControls(true);
 
     const byStableId = findByStableSelector(allInputs, selector);
     if (byStableId) return byStableId;
@@ -851,7 +879,7 @@ function findRadioLikeElement(allInputs, label, name) {
     const radios = allInputs.filter((el) => inferFieldType(el) === "radio");
 
     for (const radio of radios) {
-        const container = radio.closest('[role="radiogroup"], [role="group"], fieldset') || radio.parentElement;
+        const container = getRadioGroupContainer(radio) || radio.parentElement;
         const text = normalizeToken(container?.innerText || "");
         if (text && (text.includes(labelLower) || labelLower.includes(text.slice(0, 80)))) {
             return radio;
@@ -903,27 +931,24 @@ function fillElement(el, value) {
     el.focus();
 
     if (type === "radio") {
-        fillRadioGroup(el, desired);
-        return;
+        return fillRadioGroup(el, desired);
     }
 
     if (type === "checkbox" || role === "switch") {
-        fillBooleanControl(el, desired);
-        return;
+        return fillBooleanControl(el, desired);
     }
 
     if (el.tagName === "SELECT") {
-        fillNativeSelect(el, desired);
-        return;
+        return fillNativeSelect(el, desired);
     }
 
     if (type === "combobox" || type === "select") {
-        if (fillCompositeChoice(el, desired)) return;
+        return fillCompositeChoice(el, desired);
     }
 
     if (isContentEditableField(el) || (role === "textbox" && !("value" in el))) {
         fillEditableRegion(el, desired);
-        return;
+        return true;
     }
 
     el.click();
@@ -940,33 +965,75 @@ function fillElement(el, value) {
 
     dispatchValueEvents(el);
     flashFilledElement(el);
+    return true;
+}
+
+function getRadioGroupContainer(el) {
+    return el.closest('[role="radiogroup"], [role="group"], fieldset');
+}
+
+function getRadioGroupControls(el) {
+    const groupContainer = getRadioGroupContainer(el);
+    if (groupContainer) {
+        return collectFormControls(groupContainer)
+            .filter((candidate) => inferFieldType(candidate) === "radio")
+            .filter((candidate) => isElementVisible(candidate));
+    }
+
+    const nativeName = normalizeText(el.getAttribute("name") || el.name || "");
+    if (nativeName) {
+        return getVisibleControls(true).filter((candidate) =>
+            inferFieldType(candidate) === "radio" &&
+            normalizeText(candidate.getAttribute("name") || candidate.name || "") === nativeName
+        );
+    }
+
+    return [el];
 }
 
 function fillRadioGroup(el, value) {
-    const radios = el.name
-        ? getAllFillableControls().filter((candidate) => candidate.type === "radio" && candidate.name === el.name)
-        : [el];
+    const radios = getRadioGroupControls(el);
 
     const desired = value.toLowerCase();
     for (const radio of radios) {
         const label = getRadioOptionLabel(radio).toLowerCase();
-        const radioValue = normalizeToken(radio.value);
+        const radioValue = normalizeToken(
+            radio.value ||
+            radio.getAttribute("value") ||
+            radio.getAttribute("data-value") ||
+            radio.getAttribute("aria-label") ||
+            ""
+        );
         if (matchesChoiceValue(label, radioValue, desired)) {
             radio.click();
-            radio.checked = true;
+            if ("checked" in radio) {
+                radio.checked = true;
+            }
+            if (radio.getAttribute("role") === "radio") {
+                radio.setAttribute("aria-checked", "true");
+                for (const sibling of radios) {
+                    if (sibling !== radio && sibling.getAttribute("role") === "radio") {
+                        sibling.setAttribute("aria-checked", "false");
+                    }
+                }
+            }
             dispatchValueEvents(radio);
             flashFilledElement(radio.closest("label") || radio.parentElement || radio);
-            return;
+            return true;
         }
     }
 
-    el.click();
-    dispatchValueEvents(el);
+    return false;
 }
 
 function fillBooleanControl(el, value) {
     const normalized = normalizeToken(value);
-    const wantsChecked = TRUTHY_VALUES.has(normalized) || (!FALSY_VALUES.has(normalized) && normalized !== "");
+    const desiredBoolean = canonicalBoolean(normalized);
+    if (desiredBoolean === null) {
+        return false;
+    }
+
+    const wantsChecked = desiredBoolean === "true";
     const checked = isCheckedControl(el);
 
     if (checked !== wantsChecked) {
@@ -979,6 +1046,7 @@ function fillBooleanControl(el, value) {
 
     dispatchValueEvents(el);
     flashFilledElement(el);
+    return true;
 }
 
 function matchesChoiceValue(label, rawValue, desired) {
@@ -1003,8 +1071,17 @@ function matchesChoiceValue(label, rawValue, desired) {
 }
 
 function canonicalBoolean(value) {
+    const normalized = normalizeToken(value);
     for (const [canonical, aliases] of BOOLEAN_ALIASES.entries()) {
-        if (aliases.includes(value)) return canonical;
+        if (aliases.includes(normalized)) return canonical;
+    }
+
+    const tokenText = normalized.replace(/[^a-z0-9'\s]+/g, " ").replace(/\s+/g, " ").trim();
+    if (BOOLEAN_FALSE_PHRASES.some((phrase) => tokenText.includes(phrase))) {
+        return "false";
+    }
+    if (BOOLEAN_TRUE_PHRASES.some((phrase) => tokenText.includes(phrase))) {
+        return "true";
     }
     return null;
 }
@@ -1015,16 +1092,19 @@ function isCheckedControl(el) {
 }
 
 function fillNativeSelect(el, value) {
+    const desired = normalizeToken(value);
     const option = Array.from(el.options || []).find((candidate) => {
         const text = normalizeToken(candidate.text);
         const rawValue = normalizeToken(candidate.value);
-        const desired = normalizeToken(value);
         return text.includes(desired) || desired.includes(text) || rawValue === desired;
     });
 
-    el.value = option ? option.value : value;
+    if (!option) return false;
+
+    el.value = option.value;
     dispatchValueEvents(el);
     flashFilledElement(el);
+    return true;
 }
 
 function fillCompositeChoice(el, value) {
@@ -1102,6 +1182,34 @@ function flashFilledElement(el) {
     }, 800);
 }
 
+function readFilledValue(el, fieldType, selector, name) {
+    if (fieldType === "radio") {
+        return getRadioGroupValue(selector, name);
+    }
+    return getControlValue(el);
+}
+
+function valuesMatchRequested(actualValue, requestedValue, fieldType) {
+    const actual = normalizeText(actualValue);
+    const requested = normalizeText(requestedValue);
+    if (!requested) return false;
+
+    if (fieldType === "email") {
+        return actual.toLowerCase() === requested.toLowerCase();
+    }
+
+    if (["radio", "checkbox", "switch", "select", "combobox", "multiselect"].includes(fieldType)) {
+        const desiredBoolean = canonicalBoolean(requested);
+        const actualBoolean = canonicalBoolean(actual);
+        if (desiredBoolean !== null || actualBoolean !== null) {
+            return desiredBoolean !== null && desiredBoolean === actualBoolean;
+        }
+        return matchesChoiceValue(actual, actual, requested);
+    }
+
+    return normalizeText(actual) === normalizeText(requested);
+}
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg.type === "EXTRACT_FIELDS") {
         resetFilledTracking();
@@ -1112,9 +1220,26 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const el = findFieldElement(msg.selector, msg.label, msg.name, msg.fieldType);
 
         if (el) {
-            fillElement(el, msg.value);
-            markElementAsFilled(el);
-            sendResponse({ success: true });
+            const filled = fillElement(el, msg.value);
+            if (filled) {
+                const actualValue = readFilledValue(el, msg.fieldType, msg.selector, msg.name);
+                if (!valuesMatchRequested(actualValue, msg.value, msg.fieldType)) {
+                    sendResponse({
+                        success: false,
+                        actualValue,
+                        error: "Requested value did not stick in the DOM",
+                    });
+                    return true;
+                }
+
+                markElementAsFilled(el);
+                sendResponse({ success: true, actualValue });
+            } else {
+                sendResponse({
+                    success: false,
+                    error: "Unable to match the requested value to a valid control option",
+                });
+            }
         } else {
             console.warn("[FormPilot] Could not find element for:", msg.label, msg.selector);
             sendResponse({ success: false, error: "Element not found: " + (msg.label || msg.selector) });

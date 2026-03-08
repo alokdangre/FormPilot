@@ -6,7 +6,11 @@ def build_fill_commands(resolved_fields: list) -> list:
     commands = []
     
     for i, field in enumerate(resolved_fields):
-        if field.get("status") == "matched" and field.get("resolved_value"):
+        if (
+            field.get("status") == "matched"
+            and field.get("resolved_value")
+            and field.get("value_source") != "existing_form"
+        ):
             commands.append({
                 "type": "FILL_FIELD",
                 "selector": field.get("selector"),   # CSS selector (may be None in vision-only)

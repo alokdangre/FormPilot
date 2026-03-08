@@ -32,7 +32,16 @@ from app.agents.formpilot_agent import agent
 from app.agents.form_analyzer import process_form_analysis_async
 from app.agents.data_resolver import resolve_field_data, resolve_field_data_async
 from app.agents.form_filler import build_fill_commands
-from app.tools.form_tools import set_form_context, set_ws_callback, clear_ws_callback
+from app.tools.form_tools import (
+    set_form_context,
+    set_ws_callback,
+    clear_ws_callback,
+    note_final_user_transcript,
+    note_live_user_transcription,
+    set_verification_issues,
+    clear_verification_issues,
+    register_browser_fill_result,
+)
 
 # ═══════════════════════════════════════════════════
 # Logging
@@ -94,8 +103,9 @@ async def live_endpoint(websocket: WebSocket, user_id: str, session_id: str):
             automatic_activity_detection=types.AutomaticActivityDetection(
                 start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_HIGH,
                 end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_LOW,
-                prefix_padding_ms=80,
-                silence_duration_ms=550,
+                # Lower padding/silence reduces turn latency without disabling VAD.
+                prefix_padding_ms=40,
+                silence_duration_ms=320,
             ),
             activity_handling=types.ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
             turn_coverage=types.TurnCoverage.TURN_INCLUDES_ONLY_ACTIVITY,
@@ -181,7 +191,19 @@ async def live_endpoint(websocket: WebSocket, user_id: str, session_id: str):
             live_request_queue=live_request_queue,
             run_config=run_config,
         ):
-            event_json = event.model_dump_json(exclude_none=True, by_alias=True)
+            # Use Pydantic JSON mode so ADK types like sets are converted
+            # into JSON-safe structures before we inspect or forward them.
+            event_data = event.model_dump(mode="json", exclude_none=True, by_alias=True)
+            input_transcription = event_data.get("inputTranscription") or {}
+            if input_transcription.get("finished") and input_transcription.get("text"):
+                note_final_user_transcript(input_transcription.get("text", ""))
+            elif input_transcription.get("text"):
+                note_live_user_transcription(
+                    input_transcription.get("text", ""),
+                    bool(input_transcription.get("finished")),
+                )
+
+            event_json = json.dumps(event_data)
             logger.debug(f"[Live] Event: {event_json[:200]}...")
             await websocket.send_text(event_json)
 
@@ -268,12 +290,21 @@ async def form_endpoint(ws: WebSocket):
                 logger.info("[Verify] Starting verification")
                 screenshot = message.get("screenshot", "")
                 expected_fields = message.get("fields", [])
+                dom_fields = message.get("dom_fields", [])
 
                 await send_update("Verifying...", "Checking filled form...")
 
                 try:
-                    from app.tools.verification_tools import verify_filled_form
-                    result = await verify_filled_form(screenshot, expected_fields)
+                    from app.tools.verification_tools import verify_filled_form, verify_filled_form_dom
+                    if dom_fields:
+                        result = verify_filled_form_dom(dom_fields, expected_fields)
+                    else:
+                        result = await verify_filled_form(screenshot, expected_fields)
+                    result = _normalize_verification_result(result)
+                    if result.get("verified"):
+                        clear_verification_issues()
+                    else:
+                        set_verification_issues(result.get("issues", []))
                     await ws.send_text(json.dumps({
                         "type": "VERIFICATION_RESULT",
                         "status": "Verified" if result.get("verified") else "Issues Found",
@@ -287,6 +318,19 @@ async def form_endpoint(ws: WebSocket):
                         "result": {"verified": False, "issues": [{"error": str(e)}]}
                     }))
 
+            elif message["type"] == "fill_result":
+                result = register_browser_fill_result(
+                    field_label=message.get("label", ""),
+                    success=bool(message.get("success")),
+                    actual_value=message.get("actual_value", ""),
+                    error=message.get("error", ""),
+                )
+                logger.info(
+                    "[FillResult] %s: %s",
+                    result.get("status"),
+                    result.get("field_label", message.get("label", "")),
+                )
+
     except WebSocketDisconnect:
         logger.info("[Form] Client disconnected")
     except Exception as e:
@@ -296,3 +340,29 @@ async def form_endpoint(ws: WebSocket):
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "formpilot", "adk": True}
+
+
+def _normalize_verification_result(result: dict) -> dict:
+    issues = result.get("issues", []) or []
+    actionable = []
+    warnings = []
+
+    for issue in issues:
+        actual = str(issue.get("actual", "")).strip().lower()
+        error = str(issue.get("error", "")).strip()
+        if error:
+            actionable.append(issue)
+            continue
+
+        if "not visible in screenshot" in actual or "field not visible" in actual:
+            warnings.append(issue)
+            continue
+
+        actionable.append(issue)
+
+    normalized = dict(result)
+    normalized["issues"] = actionable
+    if warnings:
+        normalized["warnings"] = warnings
+    normalized["verified"] = not actionable
+    return normalized

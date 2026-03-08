@@ -95,10 +95,12 @@ function connectLiveWS() {
                             }, (response) => {
                                 if (chrome.runtime.lastError) {
                                     console.error("[SW] Fill failed:", chrome.runtime.lastError);
-                                    broadcast({
-                                        type: "BACKEND_UPDATE",
-                                        status: "Fill failed",
-                                        message: `⚠️ Failed to fill: ${eventData.label}`
+                                    sendToFormWS({
+                                        type: "fill_result",
+                                        label: eventData.label,
+                                        value: eventData.value,
+                                        success: false,
+                                        error: chrome.runtime.lastError.message,
                                     });
                                     broadcast({
                                         type: "VOICE_FIELD_FILL_FAILED",
@@ -106,20 +108,46 @@ function connectLiveWS() {
                                         value: eventData.value,
                                         error: chrome.runtime.lastError.message,
                                     });
-                                } else {
+                                } else if (!response?.success) {
+                                    const error = response?.error || "Fill rejected by content script";
+                                    sendToFormWS({
+                                        type: "fill_result",
+                                        label: eventData.label,
+                                        value: eventData.value,
+                                        success: false,
+                                        actual_value: response?.actualValue || "",
+                                        error,
+                                    });
                                     broadcast({
-                                        type: "BACKEND_UPDATE",
-                                        status: "Filled",
-                                        message: `✅ Voice filled: ${eventData.label}`
+                                        type: "VOICE_FIELD_FILL_FAILED",
+                                        label: eventData.label,
+                                        value: eventData.value,
+                                        actualValue: response?.actualValue || "",
+                                        error,
+                                    });
+                                } else {
+                                    sendToFormWS({
+                                        type: "fill_result",
+                                        label: eventData.label,
+                                        value: eventData.value,
+                                        success: true,
+                                        actual_value: response?.actualValue || eventData.value,
                                     });
                                     broadcast({
                                         type: "VOICE_FIELD_FILLED",
                                         label: eventData.label,
-                                        value: eventData.value,
+                                        value: response?.actualValue || eventData.value,
                                     });
                                 }
                             });
                         } else {
+                            sendToFormWS({
+                                type: "fill_result",
+                                label: eventData.label,
+                                value: eventData.value,
+                                success: false,
+                                error: "No active tab found",
+                            });
                             broadcast({
                                 type: "VOICE_FIELD_FILL_FAILED",
                                 label: eventData.label,
@@ -373,7 +401,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             sendToFormWS({
                 type: "verify_form",
                 screenshot: request.screenshot,
-                fields: request.fields || []
+                fields: request.fields || [],
+                dom_fields: request.dom_fields || [],
             });
             sendResponse({ success: true });
             return false;

@@ -36,6 +36,15 @@ def resolve_field_data(merged_fields: list) -> list:
     for i, f in enumerate(merged_fields):
         label = str(f.get("label", "")).lower().strip()
         field_type = str(f.get("type", "text")).lower()
+        existing_value = _get_existing_form_value(f)
+
+        if existing_value is not None:
+            f["resolved_value"] = existing_value
+            f["status"] = "matched"
+            f["needs_user_input"] = False
+            f["value_source"] = "existing_form"
+            resolved.append(f)
+            continue
         
         # Pass 1: Fast match by field type + simple keyword
         value = _fast_match(label, field_type, f)
@@ -45,10 +54,12 @@ def resolve_field_data(merged_fields: list) -> list:
             f["resolved_value"] = value
             f["status"] = "matched"
             f["needs_user_input"] = False
+            f["value_source"] = "profile"
         else:
             f["resolved_value"] = ""
             f["status"] = "pending"
             f["needs_user_input"] = True
+            f["value_source"] = "missing"
             unmatched_indices.append(i)
         
         resolved.append(f)
@@ -63,6 +74,7 @@ def resolve_field_data(merged_fields: list) -> list:
                     resolved[idx]["resolved_value"] = sanitized_value
                     resolved[idx]["status"] = "matched"
                     resolved[idx]["needs_user_input"] = False
+                    resolved[idx]["value_source"] = "profile_ai"
         except Exception as e:
             logger.warning(f"AI matching failed, leaving fields as pending: {e}")
     
@@ -190,6 +202,48 @@ def _canonical_boolean(value: str) -> str | None:
     if value in BOOLEAN_FALSE:
         return "false"
     return None
+
+
+def _get_existing_form_value(field: dict) -> str | None:
+    current_value = str(field.get("current_value", "")).strip()
+    if not current_value:
+        return None
+
+    normalized = current_value.lower()
+    label = str(field.get("label", "")).strip().lower()
+    placeholder = str(field.get("placeholder", "")).strip().lower()
+
+    # Ignore obvious placeholder/default prompt values.
+    placeholder_like_prefixes = (
+        "select ",
+        "choose ",
+        "pick ",
+        "enter ",
+        "type ",
+    )
+    placeholder_like_exact = {
+        "select",
+        "select one",
+        "choose",
+        "choose one",
+        "please select",
+        "please choose",
+        "n/a",
+    }
+
+    if normalized in placeholder_like_exact:
+        return None
+
+    if any(normalized.startswith(prefix) for prefix in placeholder_like_prefixes):
+        return None
+
+    if placeholder and normalized == placeholder:
+        return None
+
+    if label and normalized == label:
+        return None
+
+    return current_value
 
 
 def _ai_match(unmatched_fields: list) -> list:

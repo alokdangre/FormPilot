@@ -7,6 +7,9 @@ let lastAutoVerifyKey = "";
 let playbackContext = null;
 let playbackCursorTime = 0;
 let pendingVoiceStart = false;
+let lastReviewPromptKey = "";
+let lastFillFailurePromptKey = "";
+let pendingLiveInstruction = "";
 
 document.addEventListener('DOMContentLoaded', () => {
     const analyzeBtn = document.getElementById('analyze-btn');
@@ -26,6 +29,7 @@ document.addEventListener('DOMContentLoaded', () => {
             if (msg.connected) {
                 pendingVoiceStart = false;
                 addActivityLog("🟢 Live voice connection established");
+                flushPendingLiveInstruction();
                 maybeKickoffVoiceFormFlow();
             } else if (pendingVoiceStart) {
                 addActivityLog("⚠️ Live voice connection dropped.");
@@ -43,6 +47,8 @@ document.addEventListener('DOMContentLoaded', () => {
             currentAnalyzedFields = msg.fields || [];
             lastVoiceKickoffKey = "";
             lastAutoVerifyKey = "";
+            lastReviewPromptKey = "";
+            lastFillFailurePromptKey = "";
             resetHeardLog();
             document.getElementById('analyze-btn').innerText = "⚡ Re-Analyze & Fill";
             document.getElementById('analyze-btn').disabled = false;
@@ -94,7 +100,10 @@ document.addEventListener('DOMContentLoaded', () => {
         }
 
         if (msg.type === "VOICE_FIELD_FILL_FAILED") {
-            addActivityLog(`⚠️ Voice fill failed: ${msg.label || 'field'}`);
+            const suffix = msg.error ? ` — ${msg.error}` : "";
+            addActivityLog(`⚠️ Voice fill failed: ${msg.label || 'field'}${suffix}`);
+            reopenFieldForRetry(msg.label, msg.actualValue || "");
+            maybePromptImmediateFillRetry(msg);
         }
 
         // ── Turn complete (AI finished responding) ──
@@ -114,10 +123,22 @@ document.addEventListener('DOMContentLoaded', () => {
             if (msg.result?.verified) {
                 updateStatus("✅ Verified", true);
                 addActivityLog("✅ All fields verified correctly!");
+                const warnings = msg.result?.warnings || [];
+                warnings.forEach((issue) => {
+                    const field = issue?.field || issue?.label || "Unknown field";
+                    addActivityLog(`ℹ️ Could not visually confirm ${field} because it was not visible in the screenshot.`);
+                });
+                maybePromptPostVerificationReview();
             } else {
                 updateStatus("⚠️ Issues Found", true);
                 const issues = msg.result?.issues || [];
+                const warnings = msg.result?.warnings || [];
                 addActivityLog(`⚠️ ${issues.length} issue(s) found.`);
+                warnings.forEach((issue) => {
+                    const field = issue?.field || issue?.label || "Unknown field";
+                    addActivityLog(`ℹ️ Could not visually confirm ${field} because it was not visible in the screenshot.`);
+                });
+                applyVerificationIssuesToFieldList(issues);
                 issues.forEach((issue) => {
                     const field = issue?.field || issue?.label || "Unknown field";
                     const expected = issue?.expected || issue?.value_we_injected || "";
@@ -134,6 +155,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     if (actual) parts.push(`saw "${actual}"`);
                     addActivityLog(parts.join(" — "));
                 });
+                maybePromptCorrectionReview(issues);
             }
         }
     });
@@ -406,24 +428,72 @@ function updateResolvedFieldList(fields) {
     });
 }
 
+function findFieldInListByLabel(label) {
+    if (!label) return null;
+
+    const desired = String(label || '').toLowerCase().trim();
+    return currentAnalyzedFields.find((field) => {
+        const fieldLabel = (field.label || '').toLowerCase().trim();
+        return fieldLabel === desired || fieldLabel.includes(desired) || desired.includes(fieldLabel);
+    }) || null;
+}
+
 function applyVoiceFillToFieldList(label, value) {
     if (!currentAnalyzedFields.length || !label) return;
 
-    const target = currentAnalyzedFields.find((field) => {
-        const fieldLabel = (field.label || '').toLowerCase().trim();
-        const desired = String(label || '').toLowerCase().trim();
-        return fieldLabel === desired || fieldLabel.includes(desired) || desired.includes(fieldLabel);
-    });
-
+    const target = findFieldInListByLabel(label);
     if (!target) return;
 
     target.resolved_value = value;
     target.current_value = value;
     target.status = 'matched';
     target.needs_user_input = false;
+    delete target.verification_issue;
+    delete target.last_attempted_value;
     updateResolvedFieldList(currentAnalyzedFields);
 
     maybeVerifyVoiceCompletion();
+}
+
+function reopenFieldForRetry(label, actualValue) {
+    if (!currentAnalyzedFields.length || !label) return;
+
+    const target = findFieldInListByLabel(label);
+    if (!target) return;
+
+    lastAutoVerifyKey = "";
+    target.status = 'pending';
+    target.needs_user_input = true;
+    target.last_attempted_value = target.resolved_value || '';
+    target.resolved_value = '';
+    if (actualValue) {
+        target.current_value = actualValue;
+    }
+    updateResolvedFieldList(currentAnalyzedFields);
+}
+
+function applyVerificationIssuesToFieldList(issues) {
+    if (!currentAnalyzedFields.length || !issues?.length) return;
+    lastAutoVerifyKey = "";
+
+    issues.forEach((issue) => {
+        const target = currentAnalyzedFields.find((field) => {
+            const fieldLabel = (field.label || '').toLowerCase().trim();
+            const issueLabel = String(issue?.field || issue?.label || '').toLowerCase().trim();
+            return issueLabel && (fieldLabel === issueLabel || fieldLabel.includes(issueLabel) || issueLabel.includes(fieldLabel));
+        });
+
+        if (!target) return;
+
+        target.status = 'pending';
+        target.needs_user_input = true;
+        target.last_attempted_value = target.resolved_value || '';
+        target.current_value = issue?.actual || target.current_value || '';
+        target.resolved_value = '';
+        target.verification_issue = issue;
+    });
+
+    updateResolvedFieldList(currentAnalyzedFields);
 }
 
 function applyFilledCommandToFieldList(cmd) {
@@ -444,6 +514,8 @@ function applyFilledCommandToFieldList(cmd) {
     target.current_value = cmd.value;
     target.status = 'matched';
     target.needs_user_input = false;
+    delete target.verification_issue;
+    delete target.last_attempted_value;
     updateResolvedFieldList(currentAnalyzedFields);
 }
 
@@ -477,24 +549,7 @@ function maybeStartAutonomousVoiceSession() {
         return;
     }
 
-    pendingVoiceStart = true;
-    ensurePlaybackContext();
-    updateStatus("Starting voice...", true);
-    addActivityLog("🎤 Starting autonomous voice completion...");
-
-    chrome.runtime.sendMessage({ type: "START_MIC" }, (resp) => {
-        if (chrome.runtime.lastError || !resp?.success) {
-            pendingVoiceStart = false;
-            updateStatus("Voice start failed", false);
-            addActivityLog("❌ Voice start failed. Check extension microphone permission.");
-            return;
-        }
-
-        isRecording = true;
-        pendingVoiceStart = false;
-        streamingText = "";
-        updateStatus("Listening...", true);
-        addActivityLog("🎤 Listening for your answer...");
+    startLiveConversationSession("🎤 Starting autonomous voice completion...", () => {
         maybeKickoffVoiceFormFlow();
     });
 }
@@ -512,19 +567,110 @@ function maybeVerifyVoiceCompletion() {
     triggerVerification(currentAnalyzedFields, "🔍 Verifying voice-filled form...");
 }
 
+function maybePromptCorrectionReview(issues) {
+    if (!issues?.length) return;
+
+    const promptKey = issues
+        .map((issue) => `${issue.field || issue.label}:${issue.actual || ''}`)
+        .join('|');
+    if (!promptKey || promptKey === lastReviewPromptKey) return;
+    lastReviewPromptKey = promptKey;
+
+    const labels = issues.map((issue) => issue.field || issue.label).filter(Boolean).join(', ');
+    const instruction = `Verification found issues with these fields: ${labels}. Start an interactive correction flow now. Ask about the first incorrect field, wait for my answer, update only one field for each answer, and continue until the issues are fixed.`;
+    queueLiveInstruction(instruction);
+    if (!isRecording) {
+        startLiveConversationSession("🎤 Starting voice review for verification issues...");
+    } else {
+        flushPendingLiveInstruction();
+    }
+}
+
+function maybePromptPostVerificationReview() {
+    const promptKey = currentAnalyzedFields
+        .map((field) => `${field.label}:${field.resolved_value || ''}`)
+        .join('|');
+    if (!promptKey || promptKey === lastReviewPromptKey) return;
+    lastReviewPromptKey = promptKey;
+
+    queueLiveInstruction("Verification looks good. In one short sentence, ask the user if everything looks good or if anything should be updated.");
+    if (!isRecording) {
+        startLiveConversationSession("🎤 Starting live review...");
+    } else {
+        flushPendingLiveInstruction();
+    }
+}
+
 function triggerVerification(fields, logMessage) {
     if (logMessage) {
         addActivityLog(logMessage);
     }
 
-    chrome.runtime.sendMessage({ type: "CAPTURE_SCREENSHOT" }, (response) => {
-        if (!chrome.runtime.lastError && response?.dataUrl) {
+    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+        if (!tabs[0]) {
+            addActivityLog("⚠️ DOM verification skipped: no active tab found.");
+            return;
+        }
+
+        chrome.tabs.sendMessage(tabs[0].id, { type: "EXTRACT_FIELDS" }, (resp) => {
+            if (chrome.runtime.lastError || !resp?.fields) {
+                addActivityLog("⚠️ DOM verification skipped: could not read current form state.");
+                return;
+            }
+
             chrome.runtime.sendMessage({
                 type: "SEND_VERIFY",
-                screenshot: response.dataUrl,
-                fields: fields
+                screenshot: "",
+                fields: fields,
+                dom_fields: resp.fields || [],
             });
+        });
+    });
+}
+
+function startLiveConversationSession(startLogMessage, onReady) {
+    if (isRecording) {
+        if (typeof onReady === 'function') onReady();
+        return;
+    }
+
+    pendingVoiceStart = true;
+    ensurePlaybackContext();
+    updateStatus("Starting voice...", true);
+    if (startLogMessage) {
+        addActivityLog(startLogMessage);
+    }
+
+    chrome.runtime.sendMessage({ type: "START_MIC" }, (resp) => {
+        if (chrome.runtime.lastError || !resp?.success) {
+            pendingVoiceStart = false;
+            updateStatus("Voice start failed", false);
+            addActivityLog("❌ Voice start failed. Check extension microphone permission.");
+            return;
         }
+
+        isRecording = true;
+        pendingVoiceStart = false;
+        streamingText = "";
+        updateStatus("Listening...", true);
+        addActivityLog("🎤 Listening for your answer...");
+        if (typeof onReady === 'function') onReady();
+        flushPendingLiveInstruction();
+    });
+}
+
+function queueLiveInstruction(text) {
+    pendingLiveInstruction = text || "";
+}
+
+function flushPendingLiveInstruction() {
+    if (!pendingLiveInstruction || !liveConnected) return;
+
+    const text = pendingLiveInstruction;
+    pendingLiveInstruction = "";
+    chrome.runtime.sendMessage({
+        type: "SEND_TEXT_TO_LIVE",
+        text
     });
 }
 
